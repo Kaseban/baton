@@ -162,6 +162,7 @@ fn register_zed(path: &Path) -> anyhow::Result<bool> {
 
 fn register_codex(path: &Path) -> anyhow::Result<bool> {
     // Codex uses TOML; we do a conservative line-based insert under [mcp_servers].
+    ensure_parent(path)?;
     let raw = std::fs::read_to_string(path).unwrap_or_default();
     let header = "[mcp_servers.baton]";
     if raw.contains("mcp_servers.baton") || raw.contains(header) {
