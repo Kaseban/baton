@@ -43,6 +43,33 @@ pub fn unregister(d: &DetectedAgent) -> anyhow::Result<bool> {
     }
 }
 
+/// Check whether baton is actually registered in an agent's config (parses the
+/// config instead of substring-matching, so a stray "baton" elsewhere doesn't count).
+pub fn is_registered(d: &DetectedAgent) -> anyhow::Result<bool> {
+    let key_path: &[&str] = match d.agent {
+        Agent::Opencode => &["mcp", "servers", SERVER_NAME],
+        Agent::Zed => &["context_servers", SERVER_NAME],
+        Agent::Codex => {
+            let raw = std::fs::read_to_string(&d.config_path).unwrap_or_default();
+            return Ok(raw.contains("[mcp_servers.baton]"));
+        }
+        Agent::Aider | Agent::Unknown => return Ok(false),
+        _ => &["mcpServers", SERVER_NAME],
+    };
+    let root = match load_json_or_default(&d.config_path) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+    let mut cur = &root;
+    for k in key_path {
+        match cur.get(k) {
+            Some(v) => cur = v,
+            None => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
 fn server_entry() -> Value {
     let cmd = server_command();
     json!({
@@ -145,7 +172,12 @@ fn register_cline(path: &Path) -> anyhow::Result<bool> {
 }
 
 fn register_zed(path: &Path) -> anyhow::Result<bool> {
-    let mut root = load_json_or_default(path)?;
+    // Zed settings.json is JSONC; bail with a hint rather than stripping comments.
+    let mut root = load_json_or_default(path).map_err(|e| {
+        anyhow::anyhow!(
+            "{e:#}. Zed settings.json may contain comments (JSONC), which baton won't rewrite — add the baton entry under \"context_servers\" manually."
+        )
+    })?;
     let obj = root
         .as_object_mut()
         .context("zed settings not an object")?;
@@ -170,11 +202,11 @@ fn register_codex(path: &Path) -> anyhow::Result<bool> {
     }
     let cmd = server_command();
     let entry = format!(
-        "\n{header}\ncommand = \"{}\"\nargs = [{}]\n",
-        cmd[0],
+        "\n{header}\ncommand = {}\nargs = [{}]\n",
+        toml_string(&cmd[0]),
         cmd[1..]
             .iter()
-            .map(|a| format!("\"{}\"", a.replace('"', "\\\"")))
+            .map(|a| toml_string(a))
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -250,19 +282,28 @@ fn load_json_or_default(path: &Path) -> anyhow::Result<Value> {
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// Escape a value as a TOML basic string (handles Windows backslash paths).
+fn toml_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn save_json(path: &Path, v: &Value) -> anyhow::Result<bool> {
     ensure_parent(path)?;
+    // Rewriting a live agent config: keep a one-shot backup of the original.
+    if path.exists() {
+        let bak = path.with_extension("json.baton-bak");
+        let _ = std::fs::copy(path, bak);
+    }
     let pretty = serde_json::to_string_pretty(v)?;
     std::fs::write(path, pretty).with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
 }
 
 fn ensure_parent(path: &Path) -> anyhow::Result<()> {
-    if let Some(p) = path.parent() {
-        if !p.as_os_str().is_empty() && !p.exists() {
+    if let Some(p) = path.parent()
+        && !p.as_os_str().is_empty() && !p.exists() {
             std::fs::create_dir_all(p).with_context(|| format!("mkdir {}", p.display()))?;
         }
-    }
     Ok(())
 }
 
@@ -292,5 +333,80 @@ fn remove_nested(root: &mut Value, keys: &[&str]) -> bool {
             return false;
         };
         remove_nested(child, &keys[1..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("baton-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name)
+    }
+
+    fn detected(agent: Agent, path: &Path) -> DetectedAgent {
+        DetectedAgent {
+            agent,
+            config_path: path.to_path_buf(),
+            config_exists: path.exists(),
+            has_sessions: false,
+        }
+    }
+
+    #[test]
+    fn register_unregister_json_round_trip() {
+        let path = tmp("claude.json");
+        std::fs::write(&path, r#"{"other": {"keep": true}}"#).unwrap();
+        let d = detected(Agent::ClaudeCode, &path);
+
+        assert!(register(&d).unwrap());
+        assert!(is_registered(&d).unwrap());
+        // second register is a no-op
+        assert!(!register(&d).unwrap());
+
+        // existing config preserved
+        let root: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(root["other"]["keep"], true);
+        assert!(root["mcpServers"]["baton"]["command"].is_string());
+
+        assert!(unregister(&d).unwrap());
+        assert!(!is_registered(&d).unwrap());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn is_registered_ignores_unrelated_baton_mentions() {
+        let path = tmp("gemini.json");
+        std::fs::write(&path, r#"{"note": "I love baton"}"#).unwrap();
+        let d = detected(Agent::GeminiCli, &path);
+        assert!(!is_registered(&d).unwrap());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn codex_toml_register_unregister() {
+        let path = tmp("config.toml");
+        std::fs::write(&path, "model = \"o3\"\n").unwrap();
+        let d = detected(Agent::Codex, &path);
+
+        assert!(register(&d).unwrap());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[mcp_servers.baton]"));
+        assert!(raw.contains("model = \"o3\""));
+        assert!(is_registered(&d).unwrap());
+
+        assert!(unregister(&d).unwrap());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("mcp_servers.baton"));
+        assert!(raw.contains("model = \"o3\""));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn toml_string_escapes_windows_paths() {
+        assert_eq!(toml_string(r"C:\bin\baton.exe"), r#""C:\\bin\\baton.exe""#);
     }
 }

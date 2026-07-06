@@ -20,5 +20,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo check --features mcp
       - run: cargo build --features mcp
-      - run: cargo clippy --features mcp -- -D warnings || true
-      - run: cargo test --features mcp || true
+      - run: cargo clippy --features mcp -- -D warnings
+      - run: cargo test --features mcp

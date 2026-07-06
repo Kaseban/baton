@@ -86,37 +86,26 @@ pub fn paths_for(agent: Agent) -> (Option<PathBuf>, Option<PathBuf>) {
             };
             base.map(|b| b.join("settings.json"))
         }
-        Agent::Aider => home.as_ref().map(|h| h.join(".aider").join("conf.yml")),
+        Agent::Aider => home.as_ref().map(|h| h.join(".aider.conf.yml")),
         Agent::GeminiCli => home.as_ref().map(|h| h.join(".gemini").join("settings.json")),
         Agent::Unknown => None,
     };
 
+    // Session dirs come from each format's own `session_dir()` so detection and
+    // listing can never disagree. Aider is per-repo: look for its history file in cwd.
+    use crate::canonical::Format as _;
     let session_dir = match agent {
-        Agent::ClaudeCode => home.as_ref().map(|h| h.join(".claude").join("projects")),
-        Agent::Opencode => dirs::data_local_dir().map(|d| d.join("opencode").join("storage")),
-        Agent::Codex => home.as_ref().map(|h| h.join(".codex").join("sessions")),
-        Agent::Cursor => home.as_ref().map(|h| h.join(".cursor")),
-        Agent::Continue => home.as_ref().map(|h| h.join(".continue").join("sessions")),
-        Agent::Cline => Some(PathBuf::from(".cline")),
-        Agent::Zed => {
-            if cfg!(target_os = "macos") {
-                home.as_ref().map(|h| {
-                    h.join("Library")
-                        .join("Application Support")
-                        .join("Zed")
-                        .join("assistant")
-                        .join("conversations")
-                })
-            } else {
-                dirs::data_local_dir().map(|d| {
-                    d.join(if cfg!(target_os = "windows") { "Zed" } else { "zed" })
-                        .join("assistant")
-                        .join("conversations")
-                })
-            }
-        }
-        Agent::Aider => Some(PathBuf::from(".")),
-        Agent::GeminiCli => home.as_ref().map(|h| h.join(".gemini")),
+        Agent::ClaudeCode => Some(crate::formats::claude_code::ClaudeCode::session_dir()),
+        Agent::Opencode => Some(crate::formats::opencode::Opencode::session_dir()),
+        Agent::Codex => Some(crate::formats::codex::Codex::session_dir()),
+        Agent::Cursor => Some(crate::formats::cursor::Cursor::session_dir()),
+        Agent::Continue => Some(crate::formats::continue_dev::ContinueDev::session_dir()),
+        Agent::Cline => Some(crate::formats::cline::Cline::session_dir()),
+        Agent::Zed => Some(crate::formats::zed::Zed::session_dir()),
+        Agent::Aider => std::env::current_dir()
+            .ok()
+            .map(|d| d.join(".aider.chat.history.md")),
+        Agent::GeminiCli => Some(crate::formats::gemini_cli::GeminiCli::session_dir()),
         Agent::Unknown => None,
     };
 
@@ -161,8 +150,8 @@ pub fn detect_at_path(path: &std::path::Path) -> Agent {
     }
 
     // Heuristic: read file content and look for patterns.
-    if path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(path) {
+    if path.is_file()
+        && let Ok(content) = std::fs::read_to_string(path) {
             // Claude Code: JSONL with "type":"user"/"assistant" + "message":{"role"
             if content.contains("\"leafUuid\"") || content.contains("\"sessionId\"") {
                 return Agent::ClaudeCode;
@@ -171,22 +160,25 @@ pub fn detect_at_path(path: &std::path::Path) -> Agent {
             if content.contains("\"sessionID\"") || content.contains("ses_") {
                 return Agent::Opencode;
             }
-            // Aider: markdown with #### headers
-            if content.contains("#### user") || content.contains("#### assistant") {
+            // Aider: native history starts "# aider chat started at"; baton writes #### USER headers
+            if content.contains("# aider chat started at")
+                || content.contains("#### USER")
+                || content.contains("#### ASSISTANT")
+            {
                 return Agent::Aider;
             }
         }
-    }
 
     // Filename patterns
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         if name.starts_with("ses_") {
             return Agent::Opencode;
         }
-        if name.ends_with(".jsonl") && name.len() == 41 {
-            // UUID.jsonl pattern typical of Claude Code
-            return Agent::ClaudeCode;
-        }
+        // UUID.jsonl pattern typical of Claude Code
+        if let Some(stem) = name.strip_suffix(".jsonl")
+            && stem.len() == 36 && stem.chars().filter(|c| *c == '-').count() == 4 {
+                return Agent::ClaudeCode;
+            }
     }
 
     Agent::Unknown
@@ -204,3 +196,38 @@ pub fn server_command() -> Vec<String> {
 
 /// The canonical server name we register under in every agent config.
 pub const SERVER_NAME: &str = "baton";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filename_patterns() {
+        assert_eq!(
+            detect_at_path(std::path::Path::new("/x/ses_abc123.json")),
+            Agent::Opencode
+        );
+        assert_eq!(
+            detect_at_path(std::path::Path::new(
+                "/x/fa88b429-1234-1234-1234-123456789abc.jsonl"
+            )),
+            Agent::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn content_sniffing() {
+        let dir = std::env::temp_dir().join(format!("baton-detect-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let aider = dir.join("h.md");
+        std::fs::write(&aider, "# aider chat started at 2024-01-01\n\n#### hi\nok\n").unwrap();
+        assert_eq!(detect_at_path(&aider), Agent::Aider);
+
+        let claude = dir.join("c.txt");
+        std::fs::write(&claude, r#"{"sessionId":"x","type":"user"}"#).unwrap();
+        assert_eq!(detect_at_path(&claude), Agent::ClaudeCode);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

@@ -68,7 +68,7 @@ pub fn serve() -> anyhow::Result<()> {
             let mut out = String::new();
             for a in agents {
                 for r in crate::formats::list(a) {
-                    out.push_str(&format!("{}\t{}\t{}\n", a, r.id, r.path.display()));
+                    out.push_str(&format!("{}\t{}\t{}\n", r.agent, r.id, r.path.display()));
                 }
             }
             if out.is_empty() {
@@ -96,7 +96,7 @@ pub fn serve() -> anyhow::Result<()> {
                 std::path::Path::new(&p.input),
                 p.output.as_deref().map(std::path::Path::new),
             ) {
-                Ok(()) => "ok".to_string(),
+                Ok(out) => format!("ok: wrote {}", out.display()),
                 Err(e) => format!("error: {e:#}"),
             }
         }

@@ -52,63 +52,79 @@ impl Format for Aider {
         let mut ts = now;
 
         // Strip YAML front-matter if present
-        let content = if raw.starts_with("---") {
-            if let Some(end) = raw[3..].find("\n---") {
-                &raw[3 + end + 4..]
-            } else {
-                raw.as_str()
+        let content = match raw.strip_prefix("---") {
+            Some(rest) => match rest.find("\n---") {
+                Some(end) => &rest[end + 4..],
+                None => raw.as_str(),
+            },
+            None => raw.as_str(),
+        };
+
+        // Two dialects share the #### marker:
+        //   - baton's own output: `#### USER` / `#### ASSISTANT` role headers
+        //   - aider's native history: `#### <the user's prompt>` with the assistant
+        //     reply as unprefixed text below (files start "# aider chat started at ...")
+        let role_headers = content.lines().any(|l| {
+            matches!(l.trim(), "#### USER" | "#### ASSISTANT" | "#### SYSTEM")
+        });
+
+        let mut push = |role: Role, buffer: &mut String| {
+            if !buffer.trim().is_empty() {
+                messages.push(Message {
+                    role,
+                    parts: vec![Part::Text {
+                        text: buffer.trim().to_string(),
+                    }],
+                    time_created: ts,
+                    origin: Some(Agent::Aider),
+                });
+                ts += 1;
+            }
+            buffer.clear();
+        };
+
+        if role_headers {
+            let mut current_role: Option<Role> = None;
+            let mut buffer = String::new();
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if let Some(header) = trimmed.strip_prefix("#### ") {
+                    if let Some(r) = current_role {
+                        push(r, &mut buffer);
+                    }
+                    current_role = Some(match header.trim() {
+                        "ASSISTANT" | "assistant" => Role::Assistant,
+                        "SYSTEM" | "system" => Role::System,
+                        _ => Role::User,
+                    });
+                } else {
+                    buffer.push_str(line);
+                    buffer.push('\n');
+                }
+            }
+            if let Some(r) = current_role {
+                push(r, &mut buffer);
             }
         } else {
-            raw.as_str()
-        };
-
-        let mut current_role: Option<Role> = None;
-        let mut current_parts: Vec<Part> = Vec::new();
-        let mut buffer = String::new();
-
-        let flush = |role: &Option<Role>,
-                     parts: &mut Vec<Part>,
-                     buffer: &mut String,
-                     messages: &mut Vec<Message>,
-                     ts: &mut i64| {
-            if let Some(r) = role {
-                if !buffer.trim().is_empty() {
-                    parts.push(Part::Text {
-                        text: buffer.trim().to_string(),
-                    });
-                }
-                if !parts.is_empty() {
-                    messages.push(Message {
-                        role: *r,
-                        parts: std::mem::take(parts),
-                        time_created: *ts,
-                        origin: Some(Agent::Aider),
-                    });
-                    *ts += 1;
+            let mut user_buf = String::new();
+            let mut asst_buf = String::new();
+            for line in content.lines() {
+                if let Some(prompt) = line.trim().strip_prefix("#### ") {
+                    push(Role::Assistant, &mut asst_buf);
+                    user_buf.push_str(prompt);
+                    user_buf.push('\n');
+                } else if line.starts_with("# aider chat started at") {
+                    push(Role::User, &mut user_buf);
+                    push(Role::Assistant, &mut asst_buf);
+                } else {
+                    push(Role::User, &mut user_buf);
+                    asst_buf.push_str(line);
+                    asst_buf.push('\n');
                 }
             }
-        };
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("#### ") {
-                // Flush previous message
-                flush(&current_role, &mut current_parts, &mut buffer, &mut messages, &mut ts);
-
-                let header = trimmed.trim_start_matches("#### ").trim();
-                current_role = Some(match header {
-                    "ASSISTANT" | "assistant" => Role::Assistant,
-                    _ => Role::User,
-                });
-                current_parts.clear();
-                buffer.clear();
-            } else {
-                buffer.push_str(line);
-                buffer.push('\n');
-            }
+            push(Role::User, &mut user_buf);
+            push(Role::Assistant, &mut asst_buf);
         }
-        // Flush last message
-        flush(&current_role, &mut current_parts, &mut buffer, &mut messages, &mut ts);
 
         let first_user = messages
             .iter()
@@ -155,5 +171,47 @@ impl Format for Aider {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::{Format as _, Role};
+
+    fn read_str(name: &str, content: &str) -> Session {
+        // unique dir per test — tests run in parallel
+        let dir = std::env::temp_dir().join(format!("baton-aider-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".aider.chat.history.md");
+        std::fs::write(&path, content).unwrap();
+        let s = Aider::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        s
+    }
+
+    #[test]
+    fn parses_native_aider_history() {
+        let s = read_str(
+            "native",
+            "# aider chat started at 2024-01-01 12:00:00\n\n#### add a login page\n\nSure, adding login page now.\n\n#### make it blue\n\nDone, it is blue.\n",
+        );
+        assert_eq!(s.messages.len(), 4);
+        assert_eq!(s.messages[0].role, Role::User);
+        assert_eq!(s.messages[0].parts[0].as_text(), Some("add a login page"));
+        assert_eq!(s.messages[1].role, Role::Assistant);
+        assert_eq!(s.messages[2].role, Role::User);
+        assert_eq!(s.messages[2].parts[0].as_text(), Some("make it blue"));
+        assert_eq!(s.messages[3].role, Role::Assistant);
+    }
+
+    #[test]
+    fn parses_baton_role_headers() {
+        let s = read_str("headers", "#### USER\n\nhello\n\n#### ASSISTANT\n\nhi there\n");
+        assert_eq!(s.messages.len(), 2);
+        assert_eq!(s.messages[0].role, Role::User);
+        assert_eq!(s.messages[0].parts[0].as_text(), Some("hello"));
+        assert_eq!(s.messages[1].role, Role::Assistant);
+        assert_eq!(s.messages[1].parts[0].as_text(), Some("hi there"));
     }
 }

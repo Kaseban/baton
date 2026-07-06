@@ -77,7 +77,7 @@ impl Format for Codex {
                 ResponseItem::Reasoning { text } => {
                     (Role::Assistant, vec![Part::Reasoning { text: text.clone() }])
                 }
-                ResponseItem::FunctionCall { name, arguments, .. } => {
+                ResponseItem::FunctionCall { name, arguments, call_id } => {
                     let input = arguments
                         .as_deref()
                         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
@@ -85,16 +85,18 @@ impl Format for Codex {
                         Role::Assistant,
                         vec![Part::ToolCall {
                             name: name.clone().unwrap_or_default(),
+                            id: call_id.clone(),
                             input,
                         }],
                     )
                 }
-                ResponseItem::FunctionCallOutput { output, .. } => {
+                ResponseItem::FunctionCallOutput { output, call_id } => {
                     let text = output.clone().unwrap_or_default();
                     (
                         Role::Assistant,
                         vec![Part::ToolResult {
                             name: "function".into(),
+                            id: call_id.clone(),
                             output: Some(text),
                             is_error: None,
                         }],
@@ -176,11 +178,15 @@ enum ResponseItem {
         name: Option<String>,
         #[serde(default)]
         arguments: Option<String>,
+        #[serde(default)]
+        call_id: Option<String>,
     },
     #[serde(rename = "function_call_output")]
     FunctionCallOutput {
         #[serde(default)]
         output: Option<String>,
+        #[serde(default)]
+        call_id: Option<String>,
     },
     #[serde(other)]
     Other,

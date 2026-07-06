@@ -47,6 +47,8 @@ impl Format for Cursor {
         let now = chrono::Utc::now().timestamp_millis();
 
         // Try the wrapped shape: { "chats": { "<id>": { "messages": [...] } } }
+        // serde_json's preserve_order feature keeps file order, so "first chat"
+        // is deterministic. Extra chats are skipped (reported below).
         let chats: CursorChats = serde_json::from_str(&raw).or_else(|_| {
             // Fall back to a bare array of messages
             let msgs: Vec<CursorMessage> = serde_json::from_str(&raw)
@@ -54,21 +56,26 @@ impl Format for Cursor {
             Ok::<_, anyhow::Error>(CursorChats {
                 chats: [(
                     session_id.clone(),
-                    CursorChat {
-                        title: String::new(),
-                        messages: msgs,
-                    },
+                    serde_json::json!({ "title": "", "messages": msgs }),
                 )]
                 .into_iter()
                 .collect(),
             })
         })?;
 
-        let (id, chat) = chats
+        let total = chats.chats.len();
+        let (id, chat_value) = chats
             .chats
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("no chats found in cursor session file"))?;
+        let chat: CursorChat = serde_json::from_value(chat_value)
+            .with_context(|| format!("parsing cursor chat {id}"))?;
+        if total > 1 {
+            eprintln!(
+                "cursor export contains {total} chats; converting the first ({id}). Re-run with a single-chat export for the others."
+            );
+        }
 
         let mut messages = Vec::new();
         let mut ts = now;
@@ -125,10 +132,12 @@ impl Format for Cursor {
     }
 }
 
+// serde_json::Map preserves insertion order (preserve_order feature), making
+// "first chat in the file" deterministic — a HashMap would pick one at random.
 #[derive(Debug, Deserialize)]
 struct CursorChats {
     #[serde(default)]
-    chats: std::collections::HashMap<String, CursorChat>,
+    chats: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,7 +148,7 @@ struct CursorChat {
     messages: Vec<CursorMessage>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, serde::Serialize, Deserialize)]
 struct CursorMessage {
     #[serde(default)]
     role: String,

@@ -7,12 +7,13 @@ use anyhow::Context;
 use crate::canonical::{Agent, Session};
 use crate::formats;
 
+/// Returns the path the converted session was written to.
 pub fn convert(
     from: Agent,
     to: Agent,
     input: &Path,
     output: Option<&Path>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<std::path::PathBuf> {
     let session = formats::read(from, input)
         .with_context(|| format!("reading {} session", from))?;
     let out = output
@@ -27,7 +28,7 @@ pub fn convert(
         session.message_count(),
         out.display()
     );
-    Ok(())
+    Ok(out)
 }
 
 fn default_output(session: &Session, to: Agent) -> std::path::PathBuf {

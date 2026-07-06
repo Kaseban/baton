@@ -125,11 +125,10 @@ fn parse_content(content: &serde_json::Value) -> Vec<Part> {
                 if let Some(btype) = block.get("type").and_then(|v| v.as_str()) {
                     match btype {
                         "text" => {
-                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                if !text.is_empty() {
+                            if let Some(text) = block.get("text").and_then(|v| v.as_str())
+                                && !text.is_empty() {
                                     parts.push(Part::Text { text: text.to_string() });
                                 }
-                            }
                         }
                         "tool_call" | "tool_use" => {
                             let name = block
@@ -137,8 +136,12 @@ fn parse_content(content: &serde_json::Value) -> Vec<Part> {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("tool")
                                 .to_string();
+                            let id = block
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
                             let input = block.get("input").cloned();
-                            parts.push(Part::ToolCall { name, input });
+                            parts.push(Part::ToolCall { name, id, input });
                         }
                         _ => {}
                     }

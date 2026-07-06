@@ -73,12 +73,18 @@ pub enum Part {
     /// A tool invocation made by the assistant.
     ToolCall {
         name: String,
+        /// Source-format call id (e.g. Anthropic `tool_use.id`), used to pair with the result.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input: Option<serde_json::Value>,
     },
     /// The result of a tool invocation.
     ToolResult {
         name: String,
+        /// Call id this result answers (pairs with `ToolCall::id`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +101,8 @@ pub enum Part {
 }
 
 impl Part {
+    // Only exercised by tests today; part of the intended public surface.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn text(s: impl Into<String>) -> Self {
         Part::Text { text: s.into() }
     }
@@ -183,38 +191,56 @@ pub trait Format {
     fn write(session: &Session, out_path: &Path) -> anyhow::Result<()>;
 
     /// List all sessions known to this agent. Returns (id, title, mtime, path).
+    ///
+    /// Walks up to three directory levels deep — several agents nest sessions
+    /// (Codex: `sessions/<date>/<id>.jsonl`, Cline: `tasks/<id>/*.json`,
+    /// Gemini: `tmp/<id>/*.json`) — and only returns session-looking files.
     fn list() -> Vec<SessionRef> {
         let dir = Self::session_dir();
-        if !dir.exists() {
-            return Vec::new();
-        }
         let mut out = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if let Some(meta) = entry.metadata().ok() {
-                    let mtime = meta
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0);
-                    let id = p
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    out.push(SessionRef {
-                        agent: Self::AGENT,
-                        id,
-                        title: String::new(),
-                        path: p,
-                        mtime,
-                    });
-                }
-            }
-        }
+        walk_session_files(&dir, 3, &mut |p, mtime| {
+            let id = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            out.push(SessionRef {
+                agent: Self::AGENT,
+                id,
+                title: String::new(),
+                path: p.to_path_buf(),
+                mtime,
+            });
+        });
         out
+    }
+}
+
+/// Recursively collect files with session-like extensions (json/jsonl/md), depth-limited.
+pub fn walk_session_files(dir: &Path, depth: u32, f: &mut impl FnMut(&Path, i64)) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            if depth > 0 {
+                walk_session_files(&p, depth - 1, f);
+            }
+            continue;
+        }
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if !matches!(ext, "json" | "jsonl" | "md") {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        f(&p, mtime);
     }
 }
 
@@ -226,4 +252,37 @@ pub struct SessionRef {
     pub title: String,
     pub path: std::path::PathBuf,
     pub mtime: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walk_finds_nested_session_files() {
+        let root = std::env::temp_dir().join(format!("baton-walk-test-{}", std::process::id()));
+        let nested = root.join("2024-01-01").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("top.jsonl"), "{}").unwrap();
+        std::fs::write(root.join("2024-01-01").join("mid.json"), "{}").unwrap();
+        std::fs::write(nested.join("deep.md"), "x").unwrap();
+        std::fs::write(nested.join("skipped.log"), "x").unwrap();
+
+        let mut found = Vec::new();
+        walk_session_files(&root, 3, &mut |p, _| {
+            found.push(p.file_name().unwrap().to_string_lossy().to_string());
+        });
+        std::fs::remove_dir_all(&root).ok();
+
+        found.sort();
+        assert_eq!(found, ["deep.md", "mid.json", "top.jsonl"]);
+    }
+
+    #[test]
+    fn agent_parse_aliases() {
+        assert_eq!(Agent::parse("Claude Code"), Some(Agent::ClaudeCode));
+        assert_eq!(Agent::parse("roo"), Some(Agent::Cline));
+        assert_eq!(Agent::parse("gemini"), Some(Agent::GeminiCli));
+        assert_eq!(Agent::parse("nope"), None);
+    }
 }

@@ -120,9 +120,9 @@ cargo build --release
 
 ## Contributing
 
-Format readers are the most impactful contribution. Each format lives in `src/formats/<name>.rs` and implements the `Format` trait (read + write). See `src/formats/claude_code.rs` for a complete reference implementation.
+Each format lives in `src/formats/<name>.rs` and implements the `Format` trait (read + write). See `src/formats/claude_code.rs` for a complete reference implementation.
 
-PRs welcome for any of the stubbed formats (Codex, Cursor, Continue, Cline, Zed, Aider, Gemini CLI).
+All nine formats have readers; the most impactful contributions now are **writers** for the read-only formats (Codex, Cursor, Continue, Cline, Zed, Gemini CLI) and round-trip tests against real session files.
 
 ## License
 

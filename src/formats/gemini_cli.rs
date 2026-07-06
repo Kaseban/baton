@@ -105,12 +105,15 @@ impl Format for GeminiCli {
                     }
                     GeminiPart::FunctionCall { function_call } => Some(Part::ToolCall {
                         name: function_call.name.clone(),
+                        // Gemini pairs call/response by function name, not a call id.
+                        id: Some(function_call.name.clone()),
                         input: Some(function_call.args.clone()),
                     }),
                     GeminiPart::FunctionResponse { function_response } => {
                         let output = serde_json::to_string(&function_response.response).ok();
                         Some(Part::ToolResult {
                             name: function_response.name.clone(),
+                            id: Some(function_response.name.clone()),
                             output,
                             is_error: None,
                         })

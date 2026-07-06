@@ -67,6 +67,22 @@ pub fn list(agent: Agent) -> Vec<SessionRef> {
     }
 }
 
+/// Human-readable name for an agent.
+pub fn display_name(agent: Agent) -> &'static str {
+    match agent {
+        Agent::ClaudeCode => ClaudeCode::NAME,
+        Agent::Opencode => Opencode::NAME,
+        Agent::Codex => Codex::NAME,
+        Agent::Cursor => Cursor::NAME,
+        Agent::Continue => ContinueDev::NAME,
+        Agent::Cline => Cline::NAME,
+        Agent::Zed => Zed::NAME,
+        Agent::Aider => Aider::NAME,
+        Agent::GeminiCli => GeminiCli::NAME,
+        Agent::Unknown => "unknown",
+    }
+}
+
 /// All agents we support, in display order.
 pub const ALL_AGENTS: &[Agent] = &[
     Agent::ClaudeCode,

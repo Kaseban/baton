@@ -151,11 +151,10 @@ fn parse_content(content: &serde_json::Value) -> Vec<Part> {
                 if let Some(btype) = block.get("type").and_then(|v| v.as_str()) {
                     match btype {
                         "text" => {
-                            if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
-                                if !text.is_empty() {
+                            if let Some(text) = block.get("text").and_then(|v| v.as_str())
+                                && !text.is_empty() {
                                     parts.push(Part::Text { text: text.to_string() });
                                 }
-                            }
                         }
                         "tool_use" => {
                             let name = block
@@ -163,10 +162,18 @@ fn parse_content(content: &serde_json::Value) -> Vec<Part> {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("tool")
                                 .to_string();
+                            let id = block
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
                             let input = block.get("input").cloned();
-                            parts.push(Part::ToolCall { name, input });
+                            parts.push(Part::ToolCall { name, id, input });
                         }
                         "tool_result" => {
+                            let id = block
+                                .get("tool_use_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
                             let output = match block.get("content") {
                                 Some(serde_json::Value::String(s)) => Some(s.clone()),
                                 Some(other) => Some(other.to_string()),
@@ -175,6 +182,7 @@ fn parse_content(content: &serde_json::Value) -> Vec<Part> {
                             let is_error = block.get("is_error").and_then(|v| v.as_bool());
                             parts.push(Part::ToolResult {
                                 name: "tool".into(),
+                                id,
                                 output,
                                 is_error,
                             });

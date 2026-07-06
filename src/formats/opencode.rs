@@ -16,7 +16,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use serde::Serialize;
 use uuid::Uuid;
 
 use crate::canonical::{Agent, Format, Message, Part, Role, Session};
@@ -42,7 +41,7 @@ impl Format for Opencode {
         let info = &export.info;
         let mut messages = Vec::new();
         for msg in &export.messages {
-            let role = match msg.info.role.as_str() {
+            let mut role = match msg.info.role.as_str() {
                 "assistant" => Role::Assistant,
                 "system" => Role::System,
                 _ => Role::User,
@@ -52,20 +51,55 @@ impl Format for Opencode {
                 .time
                 .created
                 .unwrap_or(info.time.created.unwrap_or(0));
-            let parts: Vec<Part> = msg
-                .parts
-                .iter()
-                .filter_map(|p| match p.part_type.as_str() {
-                    "text" => p.text.as_ref().map(|t| Part::Text { text: t.clone() }),
-                    "reasoning" | "reasoning.text" => {
-                        p.text.as_ref().map(|t| Part::Reasoning { text: t.clone() })
+            let mut parts: Vec<Part> = Vec::new();
+            for p in &msg.parts {
+                match p.part_type.as_str() {
+                    "text" => {
+                        if let Some(t) = &p.text {
+                            parts.push(Part::Text { text: t.clone() });
+                        }
                     }
-                    _ => None,
-                })
-                .collect();
+                    "reasoning" | "reasoning.text" => {
+                        if let Some(t) = &p.text {
+                            parts.push(Part::Reasoning { text: t.clone() });
+                        }
+                    }
+                    "tool" => {
+                        let name = p.tool.clone().unwrap_or_else(|| "tool".to_string());
+                        let id = p.call_id.clone();
+                        let state = p.state.as_ref();
+                        let input = state.and_then(|s| s.input.clone());
+                        parts.push(Part::ToolCall {
+                            name: name.clone(),
+                            id: id.clone(),
+                            input,
+                        });
+                        if let Some(s) = state {
+                            let is_error = s.status.as_deref() == Some("error");
+                            if s.output.is_some() || is_error {
+                                parts.push(Part::ToolResult {
+                                    name,
+                                    id,
+                                    output: s.output.clone(),
+                                    is_error: Some(is_error),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             if parts.is_empty() {
                 continue;
             }
+            // baton writes system messages as user text prefixed "[system] " (opencode
+            // only accepts user/assistant roles) — recover the original role here.
+            if role == Role::User
+                && let Some(Part::Text { text }) = parts.first_mut()
+                    && let Some(rest) = text.strip_prefix("[system] ") {
+                        *text = rest.to_string();
+                        role = Role::System;
+                    }
             messages.push(Message {
                 role,
                 parts,
@@ -108,17 +142,23 @@ impl Format for Opencode {
                     .and_then(|p| p.to_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| ".".to_string())
             });
+        // callID → (out_messages index, parts index) of the emitted "tool" part, so a
+        // ToolResult arriving in a later message folds into that part's state.
+        let mut tool_locs: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
         for msg in &session.messages {
             let msg_id = format!("msg_{}", &Uuid::new_v4().simple().to_string()[..24]);
             let ts = msg.time_created;
             let msg_info: serde_json::Value = match msg.role {
-                Role::User => serde_json::json!({
+                // opencode only accepts user/assistant; system messages are written as
+                // user with a "[system] " text prefix (recovered on read).
+                Role::User | Role::System => serde_json::json!({
                     "id": msg_id,
                     "sessionID": session_id,
                     "role": "user",
                     "time": { "created": ts },
                     "agent": "build",
-                    "model": { "providerID": "openrouter", "modelID": "z-ai/glm-5.2" },
+                    "model": { "providerID": "baton", "modelID": "imported" },
                 }),
                 Role::Assistant => {
                     let pid = prev_id.clone().unwrap_or_else(|| msg_id.clone());
@@ -128,8 +168,8 @@ impl Format for Opencode {
                         "role": "assistant",
                         "time": { "created": ts, "completed": ts + 1 },
                         "parentID": pid,
-                        "modelID": "z-ai/glm-5.2",
-                        "providerID": "openrouter",
+                        "modelID": "imported",
+                        "providerID": "baton",
                         "mode": "build",
                         "agent": "build",
                         "path": { "cwd": cwd, "root": cwd },
@@ -142,66 +182,106 @@ impl Format for Opencode {
                         },
                     })
                 }
-                Role::System => serde_json::json!({
-                    "id": msg_id,
-                    "sessionID": session_id,
-                    "role": "user",
-                    "time": { "created": ts },
-                    "agent": "build",
-                    "model": { "providerID": "openrouter", "modelID": "z-ai/glm-5.2" },
-                }),
             };
 
-            let parts_json: Vec<serde_json::Value> = msg
-                .parts
-                .iter()
-                .map(|p| {
-                    let part_id = format!("prt_{}", &Uuid::new_v4().simple().to_string()[..24]);
-                    match p {
-                        Part::Text { text } => serde_json::json!({
+            let mut parts_json: Vec<serde_json::Value> = Vec::new();
+            let mut first_text = true;
+            for p in &msg.parts {
+                let part_id = format!("prt_{}", &Uuid::new_v4().simple().to_string()[..24]);
+                match p {
+                    Part::Text { text } => {
+                        let text = if msg.role == Role::System && first_text {
+                            format!("[system] {text}")
+                        } else {
+                            text.clone()
+                        };
+                        first_text = false;
+                        parts_json.push(serde_json::json!({
                             "type": "text",
                             "text": text,
                             "id": part_id,
                             "sessionID": session_id,
                             "messageID": msg_id,
-                        }),
-                        Part::Reasoning { text } => serde_json::json!({
-                            "type": "reasoning",
-                            "text": text,
-                            "time": { "start": ts, "end": ts + 1 },
+                        }));
+                    }
+                    Part::Reasoning { text } => parts_json.push(serde_json::json!({
+                        "type": "reasoning",
+                        "text": text,
+                        "time": { "start": ts, "end": ts + 1 },
+                        "id": part_id,
+                        "sessionID": session_id,
+                        "messageID": msg_id,
+                    })),
+                    Part::ToolCall { name, id, input } => {
+                        let call_id = id
+                            .clone()
+                            .unwrap_or_else(|| format!("call_{}", &Uuid::new_v4().simple().to_string()[..16]));
+                        parts_json.push(serde_json::json!({
+                            "type": "tool",
+                            "callID": call_id,
+                            "tool": name,
                             "id": part_id,
                             "sessionID": session_id,
                             "messageID": msg_id,
-                        }),
-                        Part::ToolCall { name, input } => serde_json::json!({
-                            "type": "step-start",
-                            "id": part_id,
-                            "sessionID": session_id,
-                            "messageID": msg_id,
-                            "_tool": name,
-                            "_input": input.clone().unwrap_or(serde_json::Value::Null),
-                        }),
-                        Part::ToolResult { name, output, is_error } => serde_json::json!({
-                            "type": "text",
-                            "text": format!("[tool result: {}] {}", name, output.clone().unwrap_or_default()),
-                            "id": part_id,
-                            "sessionID": session_id,
-                            "messageID": msg_id,
-                        }),
-                        Part::Attachment { mime, path, data } => {
-                            let _ = (mime, path, data);
-                            serde_json::json!({
+                            "state": {
+                                "status": "completed",
+                                "input": input.clone().unwrap_or(serde_json::Value::Object(Default::default())),
+                                "output": "",
+                                "title": name,
+                                "metadata": {},
+                                "time": { "start": ts, "end": ts + 1 },
+                            },
+                        }));
+                        tool_locs.insert(call_id, (out_messages.len(), parts_json.len() - 1));
+                    }
+                    Part::ToolResult { name, id, output, is_error } => {
+                        // Fold into the matching tool part (possibly in an earlier message).
+                        let folded = id.as_ref().and_then(|cid| tool_locs.get(cid).copied());
+                        let out_text = output.clone().unwrap_or_default();
+                        let errored = is_error.unwrap_or(false);
+                        match folded {
+                            Some((mi, pi)) => {
+                                let target = if mi == out_messages.len() {
+                                    parts_json.get_mut(pi)
+                                } else {
+                                    out_messages
+                                        .get_mut(mi)
+                                        .and_then(|m: &mut serde_json::Value| m.get_mut("parts"))
+                                        .and_then(|ps| ps.get_mut(pi))
+                                };
+                                if let Some(state) = target.and_then(|t| t.get_mut("state")) {
+                                    state["output"] = serde_json::json!(out_text);
+                                    if errored {
+                                        state["status"] = serde_json::json!("error");
+                                        state["error"] = serde_json::json!(out_text);
+                                    }
+                                }
+                            }
+                            None => parts_json.push(serde_json::json!({
                                 "type": "text",
-                                "text": "[attachment]",
+                                "text": format!("[tool result: {}] {}", name, out_text),
                                 "id": part_id,
                                 "sessionID": session_id,
                                 "messageID": msg_id,
-                            })
+                            })),
                         }
                     }
-                })
-                .collect();
+                    Part::Attachment { .. } => parts_json.push(serde_json::json!({
+                        "type": "text",
+                        "text": "[attachment]",
+                        "id": part_id,
+                        "sessionID": session_id,
+                        "messageID": msg_id,
+                    })),
+                }
+            }
 
+            // A message whose only content folded into an earlier tool part (e.g. a
+            // Claude-style user message carrying just tool_results) would be empty —
+            // opencode rejects part-less messages, so skip it.
+            if parts_json.is_empty() {
+                continue;
+            }
             out_messages.push(serde_json::json!({
                 "info": msg_info,
                 "parts": parts_json,
@@ -218,7 +298,7 @@ impl Format for Opencode {
                 "path": "",
                 "title": format!("[{}] {}", session.origin, session.title),
                 "agent": "build",
-                "model": { "id": "z-ai/glm-5.2", "providerID": "openrouter" },
+                "model": { "id": "imported", "providerID": "baton" },
                 "version": env!("CARGO_PKG_VERSION"),
                 "summary": { "additions": 0, "deletions": 0, "files": 0 },
                 "cost": 0,
@@ -304,6 +384,8 @@ impl Sha1 {
         }
         out
     }
+    // index arithmetic mirrors the SHA-1 spec; iterator forms would obscure it
+    #[allow(clippy::needless_range_loop)]
     fn process_block(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 80];
         for i in 0..16 {
@@ -402,7 +484,127 @@ struct ExportPart {
     part_type: String,
     #[serde(default)]
     text: Option<String>,
+    /// Tool name, present on `type: "tool"` parts.
+    #[serde(default)]
+    tool: Option<String>,
+    #[serde(rename = "callID", default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    state: Option<ExportToolState>,
 }
 
-#[derive(Serialize)]
-struct _Phantom;
+#[derive(Debug, serde::Deserialize)]
+struct ExportToolState {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+    #[serde(default)]
+    output: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::{Format as _, Message, Role};
+
+    #[test]
+    fn sha1_known_vectors() {
+        let mut h = Sha1::new();
+        h.update(b"abc");
+        assert_eq!(hex_encode(&h.finalize()), "a9993e364706816aba3e25717850c26c9cd0d89d");
+
+        let mut h = Sha1::new();
+        h.update(b"");
+        assert_eq!(hex_encode(&h.finalize()), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+
+        // >64 bytes to exercise multi-block path
+        let mut h = Sha1::new();
+        h.update("a".repeat(1000).as_bytes());
+        assert_eq!(hex_encode(&h.finalize()), "291e9a6c66994949b57ba5e650361e98fc36b1ba");
+    }
+
+    #[test]
+    fn write_read_round_trip_preserves_tools_and_roles() {
+        let session = Session {
+            source_id: "orig".into(),
+            origin: Agent::ClaudeCode,
+            title: "test".into(),
+            time_created: 1000,
+            time_updated: 2000,
+            directory: Some("/tmp".into()),
+            messages: vec![
+                Message {
+                    role: Role::System,
+                    parts: vec![Part::text("be helpful")],
+                    time_created: 1000,
+                    origin: None,
+                },
+                Message {
+                    role: Role::User,
+                    parts: vec![Part::text("hi")],
+                    time_created: 1001,
+                    origin: None,
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![
+                        Part::Reasoning { text: "thinking".into() },
+                        Part::ToolCall {
+                            name: "Bash".into(),
+                            id: Some("call_1".into()),
+                            input: Some(serde_json::json!({"command": "ls"})),
+                        },
+                    ],
+                    time_created: 1002,
+                    origin: None,
+                },
+                Message {
+                    // Claude-style: tool result arrives in a following user message
+                    role: Role::User,
+                    parts: vec![Part::ToolResult {
+                        name: "Bash".into(),
+                        id: Some("call_1".into()),
+                        output: Some("file.txt".into()),
+                        is_error: Some(false),
+                    }],
+                    time_created: 1003,
+                    origin: None,
+                },
+            ],
+        };
+
+        let dir = std::env::temp_dir().join(format!("baton-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("roundtrip.json");
+        Opencode::write(&session, &path).unwrap();
+        let back = Opencode::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(back.messages[0].role, Role::System);
+        assert_eq!(back.messages[0].parts[0].as_text(), Some("be helpful"));
+        assert_eq!(back.messages[1].role, Role::User);
+        let asst = &back.messages[2];
+        assert_eq!(asst.role, Role::Assistant);
+        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text } if text == "thinking")));
+        let call = asst.parts.iter().find_map(|p| match p {
+            Part::ToolCall { name, id, input } => Some((name.clone(), id.clone(), input.clone())),
+            _ => None,
+        });
+        let (name, id, input) = call.expect("tool call survives round trip");
+        assert_eq!(name, "Bash");
+        assert_eq!(id.as_deref(), Some("call_1"));
+        assert_eq!(input.unwrap()["command"], "ls");
+        let result = asst.parts.iter().find_map(|p| match p {
+            Part::ToolResult { output, .. } => Some(output.clone()),
+            _ => None,
+        });
+        assert_eq!(result.expect("tool result folded into tool part"), Some("file.txt".into()));
+    }
+
+    #[test]
+    fn slugify_basics() {
+        assert_eq!(slugify("Hello, World!"), "hello--world");
+        assert_eq!(slugify(""), "imported");
+    }
+}

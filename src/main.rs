@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 mod canonical;
@@ -58,6 +57,11 @@ enum Cmd {
     Doctor,
     /// Remove baton from every agent's config.
     Uninstall,
+    /// Sniff a session file/dir and report which agent produced it.
+    Detect {
+        /// Path to the session file or directory.
+        path: PathBuf,
+    },
     /// Run as an MCP server (stdio transport). Called by agents automatically.
     Serve {
         /// Use HTTP transport instead of stdio.
@@ -83,16 +87,8 @@ fn main() -> anyhow::Result<()> {
             output,
             import,
         } => {
-            convert::convert(from, to, &input, output.as_deref())?;
+            let out = convert::convert(from, to, &input, output.as_deref())?;
             if import {
-                let out = output
-                    .as_deref()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::env::current_dir().unwrap().join(format!(
-                        "{}-{}.json",
-                        to,
-                        input.file_stem().and_then(|s| s.to_str()).unwrap_or("session")
-                    )));
                 convert::import_to_target(to, &out)?;
             }
         }
@@ -100,7 +96,13 @@ fn main() -> anyhow::Result<()> {
         Cmd::Install => install()?,
         Cmd::Doctor => doctor()?,
         Cmd::Uninstall => uninstall()?,
-        Cmd::Serve { http: _, bind: _ } => {
+        Cmd::Detect { path } => {
+            println!("{}", detect::detect_at_path(&path));
+        }
+        Cmd::Serve { http, bind: _ } => {
+            if http {
+                anyhow::bail!("HTTP transport not implemented yet; use stdio (omit --http)");
+            }
             #[cfg(feature = "mcp")]
             mcp::serve()?;
             #[cfg(not(feature = "mcp"))]
@@ -121,18 +123,24 @@ fn list(agent: Option<Agent>) -> anyhow::Result<()> {
     };
     let mut any = false;
     for a in agents {
-        let refs = formats::list(a);
+        let mut refs = formats::list(a);
         if refs.is_empty() {
             continue;
         }
+        refs.sort_by_key(|r| std::cmp::Reverse(r.mtime));
         any = true;
-        println!("\n# {}\n", a);
+        println!("\n# {} ({})\n", formats::display_name(a), a);
         for r in refs {
             let when = chrono::DateTime::from_timestamp_millis(r.mtime)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_default();
+            let title = if r.title.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", r.title)
+            };
             println!(
-                "  {id}  {when}  {path}",
+                "  {id}  {when}  {path}{title}",
                 id = r.id,
                 path = r.path.display()
             );
@@ -145,7 +153,7 @@ fn list(agent: Option<Agent>) -> anyhow::Result<()> {
 }
 
 fn install() -> anyhow::Result<()> {
-    let detected = detect::detect_all();
+    let detected = detect::detect_installed();
     if detected.is_empty() {
         println!("no agents detected on this system.");
         return Ok(());
@@ -173,7 +181,7 @@ fn install() -> anyhow::Result<()> {
 }
 
 fn uninstall() -> anyhow::Result<()> {
-    let detected = detect::detect_all();
+    let detected = detect::detect_installed();
     let mut removed = 0;
     for d in &detected {
         match config::unregister(d) {
@@ -190,7 +198,7 @@ fn uninstall() -> anyhow::Result<()> {
 }
 
 fn doctor() -> anyhow::Result<()> {
-    let detected = detect::detect_all();
+    let detected = detect::detect_installed();
     if detected.is_empty() {
         println!("no agents detected.");
         return Ok(());
@@ -199,7 +207,7 @@ fn doctor() -> anyhow::Result<()> {
     let mut ok = 0;
     let mut bad = 0;
     for d in &detected {
-        let registered = is_registered(d).unwrap_or(false);
+        let registered = config::is_registered(d).unwrap_or(false);
         let status = if registered { "✓" } else { "✗" };
         if registered {
             ok += 1;
@@ -214,12 +222,4 @@ fn doctor() -> anyhow::Result<()> {
     }
     println!("\n{ok} ok, {bad} missing. run `baton install` to fix.");
     Ok(())
-}
-
-fn is_registered(d: &detect::DetectedAgent) -> anyhow::Result<bool> {
-    let raw = std::fs::read_to_string(&d.config_path).unwrap_or_default();
-    if raw.trim().is_empty() {
-        return Ok(false);
-    }
-    Ok(raw.contains(detect::SERVER_NAME))
 }

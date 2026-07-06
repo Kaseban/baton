@@ -95,6 +95,7 @@ impl Format for Zed {
                                 let input = serde_json::to_value(&tool.input).ok();
                                 parts.push(Part::ToolCall {
                                     name: tool.name.clone(),
+                                    id: Some(tool.id.clone()),
                                     input,
                                 });
                             }
@@ -155,7 +156,7 @@ enum ZedMessage {
     User(ZedUserMessage),
     Agent(ZedAgentMessage),
     Resume,
-    Compaction(serde_json::Value),
+    Compaction(#[allow(dead_code)] serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,18 +169,14 @@ struct ZedUserMessage {
 #[serde(rename_all = "PascalCase")]
 enum ZedUserContent {
     Text { text: String },
-    Mention(serde_json::Value),
-    Image(serde_json::Value),
+    Mention(#[allow(dead_code)] serde_json::Value),
+    Image(#[allow(dead_code)] serde_json::Value),
 }
 
 #[derive(Debug, Deserialize)]
 struct ZedAgentMessage {
     #[serde(default)]
     content: Vec<ZedAgentContent>,
-    #[serde(default)]
-    tool_results: serde_json::Value,
-    #[serde(default)]
-    reasoning_details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,13 +184,12 @@ struct ZedAgentMessage {
 enum ZedAgentContent {
     Text { text: String },
     Thinking { text: String, #[allow(dead_code)] signature: Option<String> },
-    RedactedThinking(String),
+    RedactedThinking(#[allow(dead_code)] String),
     ToolUse(ZedToolUse),
 }
 
 #[derive(Debug, Deserialize)]
 struct ZedToolUse {
-    #[allow(dead_code)]
     id: String,
     name: String,
     input: serde_json::Value,
