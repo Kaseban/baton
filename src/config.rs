@@ -56,7 +56,8 @@ pub fn is_registered(d: &DetectedAgent) -> anyhow::Result<bool> {
         Agent::Aider | Agent::Unknown => return Ok(false),
         _ => &["mcpServers", SERVER_NAME],
     };
-    let root = match load_json_or_default(&d.config_path) {
+    // Lenient load: Zed settings are JSONC; comments must not break detection.
+    let root = match load_json_lenient(&d.config_path) {
         Ok(v) => v,
         Err(_) => return Ok(false),
     };
@@ -172,12 +173,24 @@ fn register_cline(path: &Path) -> anyhow::Result<bool> {
 }
 
 fn register_zed(path: &Path) -> anyhow::Result<bool> {
-    // Zed settings.json is JSONC; bail with a hint rather than stripping comments.
-    let mut root = load_json_or_default(path).map_err(|e| {
-        anyhow::anyhow!(
-            "{e:#}. Zed settings.json may contain comments (JSONC), which baton won't rewrite — add the baton entry under \"context_servers\" manually."
-        )
-    })?;
+    // Zed settings.json is JSONC. We can *parse* it leniently, but rewriting through
+    // serde would destroy the user's comments — so if strict JSON parsing fails,
+    // check registration leniently and otherwise refuse with a manual hint.
+    if load_json_or_default(path).is_err() {
+        let lenient = load_json_lenient(path)?;
+        if lenient
+            .get("context_servers")
+            .and_then(|s| s.get(SERVER_NAME))
+            .is_some()
+        {
+            return Ok(false); // already registered; nothing to rewrite
+        }
+        anyhow::bail!(
+            "Zed settings.json contains comments (JSONC), which baton won't rewrite — add the baton entry under \"context_servers\" manually: {}",
+            path.display()
+        );
+    }
+    let mut root = load_json_or_default(path)?;
     let obj = root
         .as_object_mut()
         .context("zed settings not an object")?;
@@ -280,6 +293,88 @@ fn load_json_or_default(path: &Path) -> anyhow::Result<Value> {
         return Ok(Value::Object(Default::default()));
     }
     serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Parse a JSON file tolerating JSONC extensions (comments, trailing commas).
+/// Read-only — never use the result to rewrite the file, it drops comments.
+fn load_json_lenient(path: &Path) -> anyhow::Result<Value> {
+    if !path.exists() {
+        return Ok(Value::Object(Default::default()));
+    }
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+    serde_json::from_str(&strip_jsonc(&raw))
+        .with_context(|| format!("parsing {} (lenient)", path.display()))
+}
+
+/// Strip // and /* */ comments plus trailing commas, respecting string literals.
+fn strip_jsonc(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            out.push(b);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1]);
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+        } else if b == b'"' {
+            in_string = true;
+            out.push(b);
+            i += 1;
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else if b == b',' {
+            // Drop the comma if the next non-whitespace/non-comment byte closes a scope.
+            let rest = &s[i + 1..];
+            let stripped_rest = strip_jsonc_lookahead(rest);
+            if matches!(stripped_rest.trim_start().as_bytes().first(), Some(b'}') | Some(b']')) {
+                i += 1;
+                continue;
+            }
+            out.push(b);
+            i += 1;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// Lookahead helper: strip comments from the head of `rest` (no string handling
+/// needed — we only inspect up to the first meaningful byte).
+fn strip_jsonc_lookahead(rest: &str) -> String {
+    let mut r = rest;
+    loop {
+        let t = r.trim_start();
+        if let Some(after) = t.strip_prefix("//") {
+            r = after.split_once('\n').map(|(_, tail)| tail).unwrap_or("");
+        } else if let Some(after) = t.strip_prefix("/*") {
+            r = after.split_once("*/").map(|(_, tail)| tail).unwrap_or("");
+        } else {
+            return t.to_string();
+        }
+    }
 }
 
 /// Escape a value as a TOML basic string (handles Windows backslash paths).
@@ -408,5 +503,59 @@ mod tests {
     #[test]
     fn toml_string_escapes_windows_paths() {
         assert_eq!(toml_string(r"C:\bin\baton.exe"), r#""C:\\bin\\baton.exe""#);
+    }
+}
+
+#[cfg(test)]
+mod jsonc_tests {
+    use super::*;
+
+    #[test]
+    fn strips_comments_and_trailing_commas() {
+        let jsonc = r#"
+{
+  // line comment
+  "theme": "dark", /* block comment */
+  "url": "https://example.com//not-a-comment",
+  "list": [1, 2, ],
+  "nested": {
+    "a": 1,
+  },
+}
+"#;
+        let v: Value = serde_json::from_str(&strip_jsonc(jsonc)).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["url"], "https://example.com//not-a-comment");
+        assert_eq!(v["list"][1], 2);
+        assert_eq!(v["nested"]["a"], 1);
+    }
+
+    #[test]
+    fn zed_jsonc_registration_detected_but_not_rewritten() {
+        let dir = std::env::temp_dir().join(format!("baton-jsonc-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // commented settings WITHOUT baton → register must refuse, file untouched
+        let original = "{\n  // my settings\n  \"theme\": \"dark\",\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let d = DetectedAgent {
+            agent: Agent::Zed,
+            config_path: path.clone(),
+            config_exists: true,
+            has_sessions: false,
+        };
+        assert!(register(&d).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!is_registered(&d).unwrap());
+
+        // commented settings WITH baton → detected as registered, no error
+        let with_baton = "{\n  // hi\n  \"context_servers\": { \"baton\": { \"command\": \"baton\" } },\n}\n";
+        std::fs::write(&path, with_baton).unwrap();
+        assert!(is_registered(&d).unwrap());
+        assert!(!register(&d).unwrap()); // no-op, no rewrite
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), with_baton);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

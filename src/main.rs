@@ -63,13 +63,7 @@ enum Cmd {
         path: PathBuf,
     },
     /// Run as an MCP server (stdio transport). Called by agents automatically.
-    Serve {
-        /// Use HTTP transport instead of stdio.
-        #[arg(long)]
-        http: bool,
-        #[arg(long, default_value = "127.0.0.1:7777")]
-        bind: String,
-    },
+    Serve,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -99,10 +93,7 @@ fn main() -> anyhow::Result<()> {
         Cmd::Detect { path } => {
             println!("{}", detect::detect_at_path(&path));
         }
-        Cmd::Serve { http, bind: _ } => {
-            if http {
-                anyhow::bail!("HTTP transport not implemented yet; use stdio (omit --http)");
-            }
+        Cmd::Serve => {
             #[cfg(feature = "mcp")]
             mcp::serve()?;
             #[cfg(not(feature = "mcp"))]

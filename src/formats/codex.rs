@@ -54,10 +54,10 @@ impl Format for Codex {
 
             let (role, parts) = match &item {
                 ResponseItem::Message { role, content, .. } => {
-                    let r = if role == "assistant" {
-                        Role::Assistant
-                    } else {
-                        Role::User
+                    let r = match role.as_str() {
+                        "assistant" => Role::Assistant,
+                        "system" => Role::System,
+                        _ => Role::User,
                     };
                     let parts: Vec<Part> = content
                         .iter()
@@ -144,8 +144,90 @@ impl Format for Codex {
         })
     }
 
-    fn write(_session: &Session, _path: &Path) -> anyhow::Result<()> {
-        anyhow::bail!("codex write not implemented. Codex resumes via ~/.codex/sessions/ directly.")
+    fn write(session: &Session, out_path: &Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(out_path)
+            .with_context(|| format!("creating {}", out_path.display()))?;
+        for msg in &session.messages {
+            let role = match msg.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+            };
+            // One ResponseItem line per part, mirroring how codex interleaves
+            // text / reasoning / function_call records in a rollout.
+            let mut texts: Vec<serde_json::Value> = Vec::new();
+            let flush_texts = |texts: &mut Vec<serde_json::Value>,
+                                   file: &mut std::fs::File|
+             -> anyhow::Result<()> {
+                if !texts.is_empty() {
+                    let line = serde_json::json!({
+                        "type": "message",
+                        "role": role,
+                        "content": std::mem::take(texts),
+                    });
+                    writeln!(file, "{}", line)?;
+                }
+                Ok(())
+            };
+            for part in &msg.parts {
+                match part {
+                    Part::Text { text } => {
+                        let content_type = if msg.role == Role::Assistant {
+                            "output_text"
+                        } else {
+                            "input_text"
+                        };
+                        texts.push(serde_json::json!({ "type": content_type, "text": text }));
+                    }
+                    Part::Reasoning { text } => {
+                        flush_texts(&mut texts, &mut file)?;
+                        writeln!(
+                            file,
+                            "{}",
+                            serde_json::json!({ "type": "reasoning", "text": text })
+                        )?;
+                    }
+                    Part::ToolCall { name, id, input } => {
+                        flush_texts(&mut texts, &mut file)?;
+                        let arguments = input
+                            .as_ref()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "{}".to_string());
+                        writeln!(
+                            file,
+                            "{}",
+                            serde_json::json!({
+                                "type": "function_call",
+                                "name": name,
+                                "arguments": arguments,
+                                "call_id": id,
+                            })
+                        )?;
+                    }
+                    Part::ToolResult { id, output, .. } => {
+                        flush_texts(&mut texts, &mut file)?;
+                        writeln!(
+                            file,
+                            "{}",
+                            serde_json::json!({
+                                "type": "function_call_output",
+                                "output": output.clone().unwrap_or_default(),
+                                "call_id": id,
+                            })
+                        )?;
+                    }
+                    Part::Attachment { .. } => {
+                        texts.push(serde_json::json!({
+                            "type": if msg.role == Role::Assistant { "output_text" } else { "input_text" },
+                            "text": "[attachment]",
+                        }));
+                    }
+                }
+            }
+            flush_texts(&mut texts, &mut file)?;
+        }
+        Ok(())
     }
 }
 
@@ -199,4 +281,66 @@ enum ContentItem {
     OutputText { text: String },
     #[serde(other)]
     Other,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::{Message, Session};
+
+    #[test]
+    fn write_read_round_trip() {
+        let dir = std::env::temp_dir().join(format!("baton-codex-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rt.jsonl");
+
+        let session = Session {
+            source_id: "rt".into(),
+            origin: Agent::ClaudeCode,
+            title: "t".into(),
+            time_created: 0,
+            time_updated: 0,
+            directory: None,
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    parts: vec![Part::text("run ls for me")],
+                    time_created: 0,
+                    origin: None,
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![
+                        Part::Reasoning { text: "planning".into() },
+                        Part::text("running it"),
+                        Part::ToolCall {
+                            name: "shell".into(),
+                            id: Some("call_7".into()),
+                            input: Some(serde_json::json!({"command": ["ls"]})),
+                        },
+                        Part::ToolResult {
+                            name: "shell".into(),
+                            id: Some("call_7".into()),
+                            output: Some("file.txt".into()),
+                            is_error: None,
+                        },
+                    ],
+                    time_created: 1,
+                    origin: None,
+                },
+            ],
+        };
+        Codex::write(&session, &path).unwrap();
+        let back = Codex::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(back.messages[0].role, Role::User);
+        assert_eq!(back.messages[0].parts[0].as_text(), Some("run ls for me"));
+        let all_parts: Vec<&Part> = back.messages.iter().flat_map(|m| m.parts.iter()).collect();
+        assert!(all_parts.iter().any(|p| matches!(p, Part::Reasoning { text } if text == "planning")));
+        assert!(all_parts.iter().any(|p| matches!(p, Part::ToolCall { name, id, input }
+            if name == "shell" && id.as_deref() == Some("call_7") && input.as_ref().unwrap()["command"][0] == "ls")));
+        assert!(all_parts.iter().any(|p| matches!(p, Part::ToolResult { id, output, .. }
+            if id.as_deref() == Some("call_7") && output.as_deref() == Some("file.txt"))));
+    }
 }

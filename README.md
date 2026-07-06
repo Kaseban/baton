@@ -86,15 +86,17 @@ Every agent format is read into a **canonical intermediate representation**, the
 |---|:---:|:---:|:---:|
 | Claude Code | ✅ | ✅ | — |
 | OpenCode | ✅ | ✅ | ✅ `opencode import` |
-| Codex CLI | ✅ | — | — |
-| Cursor | ✅¹ | — | — |
+| Codex CLI | ✅ | ✅ | — |
+| Cursor | ✅¹ | —² | — |
 | Continue | ✅ | — | — |
-| Cline / Roo | ✅ | — | — |
-| Zed | ✅ | — | — |
+| Cline / Roo | ✅ | —² | — |
+| Zed | ✅ | ✅ | — |
 | Aider | ✅ | ✅ | — |
 | Gemini CLI | ✅ | — | — |
 
 ¹ Cursor reads from exported JSON (`sqlite3 state.vscdb "SELECT value FROM ItemTable WHERE key='aiService:chats'"`)
+
+² Not planned: Cursor and Cline keep session state inside editor databases (SQLite / VS Code globalState) with no file-level import path.
 
 ## MCP server
 
@@ -122,7 +124,7 @@ cargo build --release
 
 Each format lives in `src/formats/<name>.rs` and implements the `Format` trait (read + write). See `src/formats/claude_code.rs` for a complete reference implementation.
 
-All nine formats have readers; the most impactful contributions now are **writers** for the read-only formats (Codex, Cursor, Continue, Cline, Zed, Gemini CLI) and round-trip tests against real session files.
+All nine formats have readers; Claude Code, OpenCode, Codex, Zed, and Aider also have writers. The most impactful contributions now are **writers** for Continue and Gemini CLI, and round-trip tests against real session files.
 
 ## License
 
