@@ -86,15 +86,15 @@ Every agent format is read into a **canonical intermediate representation**, the
 |---|:---:|:---:|:---:|
 | Claude Code | ✅ | ✅ | — |
 | OpenCode | ✅ | ✅ | ✅ `opencode import` |
-| Codex CLI | 🚧 | 🚧 | — |
-| Cursor | 🚧 | — | — |
-| Continue | 🚧 | 🚧 | — |
-| Cline / Roo | 🚧 | 🚧 | — |
-| Zed | 🚧 | 🚧 | — |
-| Aider | 🚧 | 🚧 | — |
-| Gemini CLI | 🚧 | 🚧 | — |
+| Codex CLI | ✅ | — | — |
+| Cursor | ✅¹ | — | — |
+| Continue | ✅ | — | — |
+| Cline / Roo | ✅ | — | — |
+| Zed | ✅ | — | — |
+| Aider | ✅ | ✅ | — |
+| Gemini CLI | ✅ | — | — |
 
-✅ = implemented · 🚧 = stubbed (format spec documented, implementation pending)
+¹ Cursor reads from exported JSON (`sqlite3 state.vscdb "SELECT value FROM ItemTable WHERE key='aiService:chats'"`)
 
 ## MCP server
 
