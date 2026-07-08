@@ -92,7 +92,7 @@ Every agent format is read into a **canonical intermediate representation**, the
 | Cline / Roo | ✅ | —² | — |
 | Zed | ✅ | ✅ | — |
 | Aider | ✅ | ✅ | — |
-| Gemini CLI | ✅ | — | — |
+| Gemini CLI | ✅ | ✅ | — |
 
 ¹ Cursor reads from exported JSON (`sqlite3 state.vscdb "SELECT value FROM ItemTable WHERE key='aiService:chats'"`)
 
@@ -124,7 +124,7 @@ cargo build --release
 
 Each format lives in `src/formats/<name>.rs` and implements the `Format` trait (read + write). See `src/formats/claude_code.rs` for a complete reference implementation.
 
-All nine formats have readers; Claude Code, OpenCode, Codex, Zed, and Aider also have writers. The most impactful contributions now are **writers** for Continue and Gemini CLI, and round-trip tests against real session files.
+All nine formats have readers; Claude Code, OpenCode, Codex, Zed, Aider, and Gemini CLI also have writers. The most impactful contribution now is a **writer** for Continue.
 
 ## License
 
