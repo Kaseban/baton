@@ -1,12 +1,18 @@
 //! OpenAI Codex CLI session format.
 //!
-//! Codex stores sessions as JSONL rollout files under `~/.codex/sessions/<YYYY-MM-DD>/<thread-id>.jsonl`.
-//! Each line is a `ResponseItem` (tagged by `type`):
-//!   - `{"type":"message","role":"user"|"assistant","content":[{type:"input_text"|"output_text",text}]}` 
-//!   - `{"type":"reasoning","text":"..."}`
-//!   - `{"type":"function_call","name":"...","arguments":"..."}`
-//!   - `{"type":"function_call_output","output":"..."}`
-//!   - `{"type":"file_change_call",...}`, etc.
+//! Codex stores sessions as JSONL rollout files under
+//! `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl`.
+//!
+//! Modern codex (0.4x+) wraps every line in an envelope:
+//!   `{"timestamp":"...","type":"session_meta"|"response_item"|"event_msg"|..., "payload":{...}}`
+//! where a `response_item` payload is a ResponseItem (tagged by `type`):
+//!   - `{"type":"message","role":"user"|"assistant","content":[{type:"input_text"|"output_text",text}]}`
+//!   - `{"type":"reasoning","summary":[{type:"summary_text",text}],"content":[{type:"reasoning_text",text}]}`
+//!   - `{"type":"function_call","name":"...","arguments":"...","call_id":"..."}`
+//!   - `{"type":"function_call_output","call_id":"...","output":"..." | {"content":"...","success":bool}}`
+//!
+//! Very old rollouts (and other tools) emit bare ResponseItem lines; the reader
+//! accepts both. The writer emits the modern envelope form.
 
 use std::path::{Path, PathBuf};
 
@@ -41,16 +47,50 @@ impl Format for Codex {
         let mut first_ts: Option<i64> = None;
         let mut last_ts: i64 = 0;
         let now = chrono::Utc::now().timestamp_millis();
+        let mut session_id = session_id;
+        let mut directory: Option<String> = None;
 
         for line in raw.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            let item: ResponseItem = match serde_json::from_str(line) {
-                Ok(e) => e,
+            // Modern envelope line, or bare legacy ResponseItem.
+            let mut line_ts: Option<i64> = None;
+            let item: ResponseItem = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(v) if v.get("payload").is_some() => {
+                    line_ts = v
+                        .get("timestamp")
+                        .and_then(|t| t.as_str())
+                        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                        .map(|dt| dt.timestamp_millis());
+                    let env_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let payload = v.get("payload").cloned().unwrap_or_default();
+                    match env_type {
+                        "session_meta" => {
+                            if let Some(id) = payload.get("id").and_then(|i| i.as_str()) {
+                                session_id = id.to_string();
+                            }
+                            directory = payload
+                                .get("cwd")
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.to_string());
+                            continue;
+                        }
+                        "response_item" => match serde_json::from_value(payload) {
+                            Ok(item) => item,
+                            Err(_) => continue,
+                        },
+                        _ => continue,
+                    }
+                }
+                Ok(v) => match serde_json::from_value(v) {
+                    Ok(item) => item,
+                    Err(_) => continue,
+                },
                 Err(_) => continue,
             };
+            let line_ts = line_ts.unwrap_or(now);
 
             let (role, parts) = match &item {
                 ResponseItem::Message { role, content, .. } => {
@@ -74,8 +114,28 @@ impl Format for Codex {
                         .collect();
                     (r, parts)
                 }
-                ResponseItem::Reasoning { text } => {
-                    (Role::Assistant, vec![Part::Reasoning { text: text.clone() }])
+                ResponseItem::Reasoning { text, summary, content } => {
+                    // Modern codex splits reasoning across summary/content arrays;
+                    // legacy (and baton ≤0.1) used a flat `text` field.
+                    let mut combined: Vec<String> = Vec::new();
+                    if !text.is_empty() {
+                        combined.push(text.clone());
+                    }
+                    combined.extend(
+                        content
+                            .iter()
+                            .chain(summary.iter())
+                            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            .filter(|t| !t.is_empty())
+                            .map(|t| t.to_string()),
+                    );
+                    if combined.is_empty() {
+                        continue;
+                    }
+                    (
+                        Role::Assistant,
+                        vec![Part::Reasoning { text: combined.join("\n") }],
+                    )
                 }
                 ResponseItem::FunctionCall { name, arguments, call_id } => {
                     let input = arguments
@@ -91,14 +151,26 @@ impl Format for Codex {
                     )
                 }
                 ResponseItem::FunctionCallOutput { output, call_id } => {
-                    let text = output.clone().unwrap_or_default();
+                    // Output is a plain string in old rollouts, an object
+                    // {"content": "...", "success": bool} in new ones.
+                    let (text, is_error) = match output {
+                        Some(serde_json::Value::String(s)) => (s.clone(), None),
+                        Some(obj) => (
+                            obj.get("content")
+                                .and_then(|c| c.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| obj.to_string()),
+                            obj.get("success").and_then(|s| s.as_bool()).map(|s| !s),
+                        ),
+                        None => (String::new(), None),
+                    };
                     (
                         Role::Assistant,
                         vec![Part::ToolResult {
                             name: "function".into(),
                             id: call_id.clone(),
                             output: Some(text),
-                            is_error: None,
+                            is_error,
                         }],
                     )
                 }
@@ -110,13 +182,13 @@ impl Format for Codex {
             }
 
             if first_ts.is_none() {
-                first_ts = Some(now);
+                first_ts = Some(line_ts);
             }
-            last_ts = now;
+            last_ts = line_ts.max(last_ts);
             messages.push(Message {
                 role,
                 parts,
-                time_created: now,
+                time_created: line_ts,
                 origin: Some(Agent::Codex),
             });
         }
@@ -139,7 +211,7 @@ impl Format for Codex {
             title,
             time_created: first_ts.unwrap_or(0),
             time_updated: last_ts,
-            directory: None,
+            directory,
             messages,
         })
     }
@@ -148,28 +220,51 @@ impl Format for Codex {
         use std::io::Write;
         let mut file = std::fs::File::create(out_path)
             .with_context(|| format!("creating {}", out_path.display()))?;
+
+        // codex resume requires a UUID session id in session_meta.
+        let meta_id = uuid::Uuid::parse_str(&session.source_id)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+        let meta_ts = iso(session.time_created);
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "timestamp": meta_ts,
+                "type": "session_meta",
+                "payload": {
+                    "id": meta_id,
+                    "timestamp": meta_ts,
+                    "cwd": session.directory.clone().unwrap_or_else(|| ".".to_string()),
+                    "originator": "baton",
+                    "cli_version": env!("CARGO_PKG_VERSION"),
+                    "instructions": null,
+                },
+            })
+        )?;
+
         for msg in &session.messages {
             let role = match msg.role {
                 Role::User => "user",
                 Role::Assistant => "assistant",
                 Role::System => "system",
             };
+            let ts = iso(msg.time_created);
+            let mut emit = |payload: serde_json::Value| -> anyhow::Result<()> {
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "timestamp": ts,
+                        "type": "response_item",
+                        "payload": payload,
+                    })
+                )?;
+                Ok(())
+            };
             // One ResponseItem line per part, mirroring how codex interleaves
             // text / reasoning / function_call records in a rollout.
             let mut texts: Vec<serde_json::Value> = Vec::new();
-            let flush_texts = |texts: &mut Vec<serde_json::Value>,
-                                   file: &mut std::fs::File|
-             -> anyhow::Result<()> {
-                if !texts.is_empty() {
-                    let line = serde_json::json!({
-                        "type": "message",
-                        "role": role,
-                        "content": std::mem::take(texts),
-                    });
-                    writeln!(file, "{}", line)?;
-                }
-                Ok(())
-            };
             for part in &msg.parts {
                 match part {
                     Part::Text { text } => {
@@ -181,41 +276,36 @@ impl Format for Codex {
                         texts.push(serde_json::json!({ "type": content_type, "text": text }));
                     }
                     Part::Reasoning { text } => {
-                        flush_texts(&mut texts, &mut file)?;
-                        writeln!(
-                            file,
-                            "{}",
-                            serde_json::json!({ "type": "reasoning", "text": text })
-                        )?;
+                        flush_message(&mut texts, role, &mut emit)?;
+                        emit(serde_json::json!({
+                            "type": "reasoning",
+                            "summary": [{ "type": "summary_text", "text": text }],
+                            "content": [],
+                        }))?;
                     }
                     Part::ToolCall { name, id, input } => {
-                        flush_texts(&mut texts, &mut file)?;
+                        flush_message(&mut texts, role, &mut emit)?;
                         let arguments = input
                             .as_ref()
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "{}".to_string());
-                        writeln!(
-                            file,
-                            "{}",
-                            serde_json::json!({
-                                "type": "function_call",
-                                "name": name,
-                                "arguments": arguments,
-                                "call_id": id,
-                            })
-                        )?;
+                        emit(serde_json::json!({
+                            "type": "function_call",
+                            "name": name,
+                            "arguments": arguments,
+                            "call_id": id,
+                        }))?;
                     }
-                    Part::ToolResult { id, output, .. } => {
-                        flush_texts(&mut texts, &mut file)?;
-                        writeln!(
-                            file,
-                            "{}",
-                            serde_json::json!({
-                                "type": "function_call_output",
-                                "output": output.clone().unwrap_or_default(),
-                                "call_id": id,
-                            })
-                        )?;
+                    Part::ToolResult { id, output, is_error, .. } => {
+                        flush_message(&mut texts, role, &mut emit)?;
+                        emit(serde_json::json!({
+                            "type": "function_call_output",
+                            "call_id": id,
+                            "output": {
+                                "content": output.clone().unwrap_or_default(),
+                                "success": !is_error.unwrap_or(false),
+                            },
+                        }))?;
                     }
                     Part::Attachment { .. } => {
                         texts.push(serde_json::json!({
@@ -225,10 +315,32 @@ impl Format for Codex {
                     }
                 }
             }
-            flush_texts(&mut texts, &mut file)?;
+            flush_message(&mut texts, role, &mut emit)?;
         }
         Ok(())
     }
+}
+
+/// Emit accumulated text content as a single `message` ResponseItem.
+fn flush_message(
+    texts: &mut Vec<serde_json::Value>,
+    role: &str,
+    emit: &mut impl FnMut(serde_json::Value) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if !texts.is_empty() {
+        emit(serde_json::json!({
+            "type": "message",
+            "role": role,
+            "content": std::mem::take(texts),
+        }))?;
+    }
+    Ok(())
+}
+
+fn iso(ts_millis: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts_millis)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn truncate_title(s: &str) -> String {
@@ -253,6 +365,10 @@ enum ResponseItem {
     Reasoning {
         #[serde(default)]
         text: String,
+        #[serde(default)]
+        summary: Vec<serde_json::Value>,
+        #[serde(default)]
+        content: Vec<serde_json::Value>,
     },
     #[serde(rename = "function_call")]
     FunctionCall {
@@ -266,7 +382,7 @@ enum ResponseItem {
     #[serde(rename = "function_call_output")]
     FunctionCallOutput {
         #[serde(default)]
-        output: Option<String>,
+        output: Option<serde_json::Value>,
         #[serde(default)]
         call_id: Option<String>,
     },

@@ -54,8 +54,33 @@ impl Format for GeminiCli {
             serde_json::from_str::<Vec<GeminiEntry>>(&raw)?
         } else if raw.trim().starts_with('{') {
             // Could be a single entry or a wrapper with candidates
-            if let Ok(entry) = serde_json::from_str::<GeminiEntry>(&raw) {
-                vec![entry]
+            // Specific shapes first: GeminiEntry has all-default fields, so it
+            // would false-match any object (yielding an empty session).
+            if let Ok(chat) = serde_json::from_str::<GeminiChatFile>(&raw) {
+                // Session recording shape: ~/.gemini/tmp/<hash>/chats/session-*.json
+                chat.messages
+                    .into_iter()
+                    .map(|m| {
+                        let mut parts = Vec::new();
+                        for t in m.thoughts {
+                            let text = [t.subject, t.description]
+                                .into_iter()
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(": ");
+                            if !text.is_empty() {
+                                parts.push(GeminiPart::Text { text, thought: Some(true) });
+                            }
+                        }
+                        if !m.content.is_empty() {
+                            parts.push(GeminiPart::Text { text: m.content, thought: None });
+                        }
+                        GeminiEntry {
+                            role: if m.msg_type == "user" { "user".into() } else { "model".into() },
+                            parts,
+                        }
+                    })
+                    .collect()
             } else if let Ok(wrapper) = serde_json::from_str::<GeminiWrapper>(&raw) {
                 wrapper
                     .candidates
@@ -65,6 +90,8 @@ impl Format for GeminiCli {
                         parts: c.content.parts,
                     })
                     .collect()
+            } else if let Ok(entry) = serde_json::from_str::<GeminiEntry>(&raw) {
+                vec![entry]
             } else {
                 // Try NDJSON (one entry per line)
                 raw.lines()
@@ -89,18 +116,13 @@ impl Format for GeminiCli {
                 .parts
                 .iter()
                 .filter_map(|p| match p {
-                    GeminiPart::Text { text } => {
+                    GeminiPart::Text { text, thought } => {
                         if text.is_empty() {
                             None
+                        } else if thought.unwrap_or(false) {
+                            Some(Part::Reasoning { text: text.clone() })
                         } else {
                             Some(Part::Text { text: text.clone() })
-                        }
-                    }
-                    GeminiPart::Thought { text, .. } => {
-                        if text.is_empty() {
-                            None
-                        } else {
-                            Some(Part::Reasoning { text: text.clone() })
                         }
                     }
                     GeminiPart::FunctionCall { function_call } => Some(Part::ToolCall {
@@ -159,9 +181,74 @@ impl Format for GeminiCli {
         })
     }
 
-    fn write(_session: &Session, _path: &Path) -> anyhow::Result<()> {
-        anyhow::bail!("gemini-cli write not implemented yet.")
+    /// Write the checkpoint shape (`/chat resume` compatible): a JSON array of
+    /// `{"role": "user"|"model", "parts": [...]}` Content objects.
+    fn write(session: &Session, out_path: &Path) -> anyhow::Result<()> {
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        for msg in &session.messages {
+            let role = match msg.role {
+                Role::Assistant => "model",
+                // Gemini has no system role in checkpoints; fold into user.
+                Role::User | Role::System => "user",
+            };
+            let mut parts: Vec<serde_json::Value> = Vec::new();
+            for p in &msg.parts {
+                match p {
+                    Part::Text { text } => parts.push(serde_json::json!({ "text": text })),
+                    Part::Reasoning { text } => {
+                        parts.push(serde_json::json!({ "text": text, "thought": true }))
+                    }
+                    Part::ToolCall { name, input, .. } => parts.push(serde_json::json!({
+                        "functionCall": {
+                            "name": name,
+                            "args": input.clone().unwrap_or(serde_json::Value::Object(Default::default())),
+                        }
+                    })),
+                    Part::ToolResult { name, output, .. } => parts.push(serde_json::json!({
+                        "functionResponse": {
+                            "name": name,
+                            "response": { "output": output.clone().unwrap_or_default() },
+                        }
+                    })),
+                    Part::Attachment { .. } => {
+                        parts.push(serde_json::json!({ "text": "[attachment]" }))
+                    }
+                }
+            }
+            if parts.is_empty() {
+                continue;
+            }
+            entries.push(serde_json::json!({ "role": role, "parts": parts }));
+        }
+        let out = serde_json::to_string_pretty(&entries)?;
+        std::fs::write(out_path, out)
+            .with_context(|| format!("writing gemini checkpoint {}", out_path.display()))?;
+        Ok(())
     }
+}
+
+/// Session recording file: `~/.gemini/tmp/<hash>/chats/session-*.json`.
+#[derive(Debug, Deserialize)]
+struct GeminiChatFile {
+    messages: Vec<GeminiChatMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiChatMessage {
+    #[serde(rename = "type", default)]
+    msg_type: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    thoughts: Vec<GeminiThought>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiThought {
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -190,13 +277,26 @@ struct GeminiContent {
     parts: Vec<GeminiPart>,
 }
 
+// Real Gemini parts are flat objects — `{"text":"..."}`, `{"functionCall":{...}}` —
+// so this must be untagged (an externally-tagged enum would expect `{"text":{"text":...}}`).
+// Variant order matters: functionCall/functionResponse first, text last.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
 enum GeminiPart {
-    Text { text: String },
-    Thought { text: String, #[allow(dead_code)] thought: Option<bool> },
-    FunctionCall { function_call: GeminiFunctionCall },
-    FunctionResponse { function_response: GeminiFunctionResponse },
+    FunctionCall {
+        #[serde(rename = "functionCall")]
+        function_call: GeminiFunctionCall,
+    },
+    FunctionResponse {
+        #[serde(rename = "functionResponse")]
+        function_response: GeminiFunctionResponse,
+    },
+    Text {
+        text: String,
+        /// `{"text":"...","thought":true}` marks a reasoning part.
+        #[serde(default)]
+        thought: Option<bool>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,4 +313,89 @@ struct GeminiFunctionResponse {
     name: String,
     #[serde(default)]
     response: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::{Message, Session};
+
+    #[test]
+    fn write_read_round_trip() {
+        let dir = std::env::temp_dir().join(format!("baton-gemini-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rt.json");
+
+        let session = Session {
+            source_id: "rt".into(),
+            origin: Agent::ClaudeCode,
+            title: "t".into(),
+            time_created: 0,
+            time_updated: 0,
+            directory: None,
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    parts: vec![Part::text("hello gemini")],
+                    time_created: 0,
+                    origin: None,
+                },
+                Message {
+                    role: Role::Assistant,
+                    parts: vec![
+                        Part::Reasoning { text: "hmm".into() },
+                        Part::text("hi"),
+                        Part::ToolCall {
+                            name: "read_file".into(),
+                            id: Some("tu_1".into()),
+                            input: Some(serde_json::json!({"path": "/x"})),
+                        },
+                        Part::ToolResult {
+                            name: "read_file".into(),
+                            id: Some("tu_1".into()),
+                            output: Some("contents".into()),
+                            is_error: Some(false),
+                        },
+                    ],
+                    time_created: 1,
+                    origin: None,
+                },
+            ],
+        };
+        GeminiCli::write(&session, &path).unwrap();
+        let back = GeminiCli::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(back.messages[0].role, Role::User);
+        assert_eq!(back.messages[0].parts[0].as_text(), Some("hello gemini"));
+        let asst = &back.messages[1];
+        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text } if text == "hmm")));
+        assert!(asst.parts.iter().any(|p| matches!(p, Part::ToolCall { name, .. } if name == "read_file")));
+        assert!(asst.parts.iter().any(|p| matches!(p, Part::ToolResult { name, .. } if name == "read_file")));
+    }
+
+    #[test]
+    fn reads_chat_recording_shape() {
+        let dir = std::env::temp_dir().join(format!("baton-gemini-chat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-1.json");
+        std::fs::write(
+            &path,
+            r#"{"sessionId":"abc","messages":[
+                {"type":"user","content":"question"},
+                {"type":"gemini","content":"answer","thoughts":[{"subject":"Plan","description":"do thing"}]}
+            ]}"#,
+        )
+        .unwrap();
+        let s = GeminiCli::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(s.messages.len(), 2);
+        assert_eq!(s.messages[0].role, Role::User);
+        assert_eq!(s.messages[0].parts[0].as_text(), Some("question"));
+        let asst = &s.messages[1];
+        assert_eq!(asst.role, Role::Assistant);
+        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text } if text == "Plan: do thing")));
+        assert!(asst.parts.iter().any(|p| p.as_text() == Some("answer")));
+    }
 }

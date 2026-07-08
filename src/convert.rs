@@ -57,12 +57,97 @@ pub fn import_to_target(to: Agent, file: &Path) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Agent::ClaudeCode => {
-            // Claude Code resumes from ~/.claude/projects/<path>/<id>.jsonl directly.
-            anyhow::bail!(
-                "claude-code resumes sessions by placing the .jsonl into ~/.claude/projects/<encoded-path>/<id>.jsonl; auto-import not wired yet."
-            )
-        }
+        Agent::ClaudeCode => import_claude(file),
+        Agent::Codex => import_codex(file),
         other => anyhow::bail!("no auto-import path for {other} yet"),
     }
+}
+
+/// Place a converted .jsonl where Claude Code will find it:
+/// `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, resumable via `claude --resume <uuid>`.
+fn import_claude(file: &Path) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(file)
+        .with_context(|| format!("reading {}", file.display()))?;
+
+    // Session id must be a UUID (it becomes the resume id). Reuse the one in the
+    // file if valid, else mint one and rewrite the sessionId fields to match.
+    let existing_id = raw
+        .lines()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .and_then(|v| v.get("sessionId").and_then(|s| s.as_str()).map(String::from));
+    let (id, contents) = match existing_id.filter(|id| uuid::Uuid::parse_str(id).is_ok()) {
+        Some(id) => (id, raw),
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            let rewritten: Vec<String> = raw
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| match serde_json::from_str::<serde_json::Value>(l) {
+                    Ok(mut v) => {
+                        v["sessionId"] = serde_json::json!(id);
+                        v.to_string()
+                    }
+                    Err(_) => l.to_string(),
+                })
+                .collect();
+            (id, rewritten.join("\n") + "\n")
+        }
+    };
+
+    // Claude encodes the project cwd by replacing path separators (and dots) with dashes.
+    let cwd = std::env::current_dir().context("getting cwd")?;
+    let encoded: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '\\' || c == '.' || c == ':' { '-' } else { c })
+        .collect();
+    let dir = dirs::home_dir()
+        .context("no home dir")?
+        .join(".claude")
+        .join("projects")
+        .join(encoded);
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    let dest = dir.join(format!("{id}.jsonl"));
+    std::fs::write(&dest, contents).with_context(|| format!("writing {}", dest.display()))?;
+    eprintln!("imported into {}", dest.display());
+    eprintln!("resume from {} with: claude --resume {id}", cwd.display());
+    Ok(())
+}
+
+/// Place a converted rollout where codex will find it:
+/// `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl`, then `codex resume <uuid>`.
+fn import_codex(file: &Path) -> anyhow::Result<()> {
+    let raw = std::fs::read_to_string(file)
+        .with_context(|| format!("reading {}", file.display()))?;
+    // The session UUID lives in the first session_meta line (the writer always emits one).
+    let id = raw
+        .lines()
+        .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("type").and_then(|t| t.as_str()) == Some("session_meta"))
+        .and_then(|v| {
+            v.get("payload")
+                .and_then(|p| p.get("id"))
+                .and_then(|i| i.as_str())
+                .map(String::from)
+        })
+        .context("no session_meta line with a session id — was this file written by baton?")?;
+
+    let now = chrono::Utc::now();
+    let dir = dirs::home_dir()
+        .context("no home dir")?
+        .join(".codex")
+        .join("sessions")
+        .join(now.format("%Y").to_string())
+        .join(now.format("%m").to_string())
+        .join(now.format("%d").to_string());
+    std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
+    let dest = dir.join(format!(
+        "rollout-{}-{id}.jsonl",
+        now.format("%Y-%m-%dT%H-%M-%S")
+    ));
+    std::fs::copy(file, &dest)
+        .with_context(|| format!("copying to {}", dest.display()))?;
+    eprintln!("imported into {}", dest.display());
+    eprintln!("resume with: codex resume {id}");
+    Ok(())
 }
