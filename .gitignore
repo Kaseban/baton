@@ -5,3 +5,9 @@
 .env
 .env.*
 *.log
+benchmark/*.jsonl
+benchmark/*.out
+benchmark/*.json
+benchmark/handoff-*.md
+benchmark/converted-*
+benchmark/__pycache__/

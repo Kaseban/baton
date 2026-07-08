@@ -111,6 +111,21 @@ baton also runs as an MCP server, exposing four tools that any coding agent can 
 
 Run `baton install` to register itself in every agent's MCP config automatically.
 
+## Benchmark
+
+Does carrying the full transcript beat writing a handoff summary for the next agent? We measured both on a real 3.4 MB Claude Code session (same model both arms, only the context differs):
+
+| session size | baton transcript | handoff summary |
+|---|---:|---:|
+| sm (93 KB) | **3/3** details recalled | 1/3 |
+| md (198 KB) | **6/6** | 1/6 |
+| lg (599 KB) | **5/8** | 1/8 |
+| **total** | **14/17** | 3/17 |
+
+The summary lost concrete facts (versions, line counts, MSRV) even on the smallest slice — the receiving agent had to re-read files and re-run commands to rediscover them. Mechanical fidelity: all 896 messages are written to every target; round-trip loss reflects each target format's expressiveness (claude-code 896/896, codex 736, gemini-cli 723, aider 111 — it stores chat text only).
+
+Full methodology, caveats, and reproduction steps: [benchmark/RESULTS.md](benchmark/RESULTS.md).
+
 ## Building
 
 ```sh
