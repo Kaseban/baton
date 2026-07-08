@@ -10,7 +10,7 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell", "npm", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
-tap = "ehsanjso/homebrew-tap"
+tap = "Kaseban/homebrew-tap"
 # A namespace to use when publishing this package to the npm registry
 npm-scope = "@kasabeh"
 # Publish jobs to run in CI
