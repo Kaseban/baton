@@ -26,10 +26,13 @@ cargo install baton-mcp
 cargo binstall baton-mcp
 
 # Homebrew
-brew install ehsanjso/tap/baton
+brew install ehsanjso/tap/baton-mcp
 
 # npm (downloads prebuilt binary, no Rust needed)
-npx baton-mcp
+npx @kasabeh/baton-mcp
+
+# Shell installer (prebuilt binary)
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ehsanjso/baton/releases/latest/download/baton-mcp-installer.sh | sh
 
 # Or download a binary from GitHub Releases
 ```
