@@ -13,9 +13,14 @@ import json, re, subprocess, sys, tempfile, pathlib
 
 HERE = pathlib.Path(__file__).parent
 BATON = HERE.parent / "target/debug/baton"
-FULL_SESSION = sorted(
-    pathlib.Path.home().glob("**/.claude/projects/-Users-ehsanjso-Desktop-work-baton-mcp/*.jsonl"),
-    key=lambda p: p.stat().st_size)[-1] if True else None
+# Session to benchmark: pass a .jsonl path as argv[1], or default to the largest
+# Claude Code session recorded for the current working directory.
+_project_slug = re.sub(r"[/.]", "-", str(pathlib.Path.cwd().parent.resolve()))
+_candidates = sorted(
+    pathlib.Path.home().glob(f".claude/projects/{_project_slug}/*.jsonl"),
+    key=lambda p: p.stat().st_size)
+FULL_SESSION = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else (
+    _candidates[-1] if _candidates else sys.exit("no session found; pass a .jsonl path"))
 MODEL = "haiku"  # same model both arms; only the context differs
 TARGETS = ["opencode", "codex", "zed", "aider", "gemini-cli", "claude-code"]
 SIZES = ["sm", "md", "lg"]
