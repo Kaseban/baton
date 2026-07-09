@@ -1,0 +1,52 @@
+{
+  "lockfileVersion": 3,
+  "name": "@kasabeh/baton-mcp",
+  "packages": {
+    "": {
+      "bin": {
+        "baton": "run-baton.js"
+      },
+      "dependencies": {
+        "detect-libc": "^2.1.2"
+      },
+      "devDependencies": {
+        "prettier": "^3.8.3"
+      },
+      "engines": {
+        "node": ">=14.14",
+        "npm": ">=6"
+      },
+      "hasInstallScript": true,
+      "license": "MIT OR Apache-2.0",
+      "name": "@kasabeh/baton-mcp",
+      "version": "0.2.0"
+    },
+    "node_modules/detect-libc": {
+      "engines": {
+        "node": ">=8"
+      },
+      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==",
+      "license": "Apache-2.0",
+      "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
+      "version": "2.1.2"
+    },
+    "node_modules/prettier": {
+      "bin": {
+        "prettier": "bin/prettier.cjs"
+      },
+      "dev": true,
+      "engines": {
+        "node": ">=14"
+      },
+      "funding": {
+        "url": "https://github.com/prettier/prettier?sponsor=1"
+      },
+      "integrity": "sha512-7igPTM53cGHMW8xWuVTydi2KO233VFiTNyF5hLJqpilHfmn8C8gPf+PS7dUT64YcXFbiMGZxS9pCSxL/Dxm/Jw==",
+      "license": "MIT",
+      "resolved": "https://registry.npmjs.org/prettier/-/prettier-3.8.3.tgz",
+      "version": "3.8.3"
+    }
+  },
+  "requires": true,
+  "version": "0.2.0"
+}
