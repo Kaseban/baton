@@ -1,0 +1,19 @@
+<svg width="640" height="160" viewBox="0 0 640 160" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="baton">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9F7AEA"/>
+      <stop offset="1" stop-color="#6C40D8"/>
+    </linearGradient>
+  </defs>
+  <!-- motion lines -->
+  <rect x="22" y="50" width="46" height="10" rx="5" fill="#94A3B8" opacity="0.55"/>
+  <rect x="10" y="75" width="34" height="10" rx="5" fill="#94A3B8" opacity="0.35"/>
+  <rect x="28" y="100" width="22" height="10" rx="5" fill="#94A3B8" opacity="0.25"/>
+  <!-- baton mid-pass -->
+  <g transform="rotate(-28 132 80)">
+    <rect x="72" y="66" width="120" height="28" rx="14" fill="url(#g)"/>
+    <rect x="72" y="66" width="26" height="28" rx="13" fill="#F5D0FE"/>
+    <rect x="166" y="66" width="26" height="28" rx="13" fill="#F5D0FE"/>
+  </g>
+  <text x="232" y="110" font-family="ui-monospace, 'SF Mono', Menlo, Consolas, monospace" font-size="92" font-weight="700" fill="url(#g)">baton</text>
+</svg>
