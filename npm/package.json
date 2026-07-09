@@ -1,0 +1,100 @@
+{
+  "artifactDownloadUrls": [
+    "https://github.com/Kaseban/baton/releases/download/v0.2.0"
+  ],
+  "bin": {
+    "baton": "run-baton.js"
+  },
+  "dependencies": {
+    "detect-libc": "^2.1.2"
+  },
+  "description": "Pass the baton between coding agents. Convert any coding-agent session to any other, and wire itself into every agent's MCP config.",
+  "devDependencies": {
+    "prettier": "^3.8.3"
+  },
+  "engines": {
+    "node": ">=14.14",
+    "npm": ">=6"
+  },
+  "glibcMinimum": {
+    "major": 2,
+    "series": 35
+  },
+  "homepage": "https://github.com/Kaseban/baton",
+  "keywords": [
+    "command-line-utilities",
+    "development-tools",
+    "development-tools::build-utils",
+    "mcp",
+    "claude",
+    "opencode",
+    "codex",
+    "cursor"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "name": "@kasabeh/baton-mcp",
+  "preferUnplugged": true,
+  "repository": "https://github.com/Kaseban/baton",
+  "scripts": {
+    "fmt": "prettier --write **/*.js",
+    "fmt:check": "prettier --check **/*.js",
+    "postinstall": "node ./install.js"
+  },
+  "supportedPlatforms": {
+    "aarch64-apple-darwin": {
+      "artifactName": "baton-mcp-aarch64-apple-darwin.tar.xz",
+      "bins": {
+        "baton": "baton"
+      },
+      "zipExt": ".tar.xz"
+    },
+    "aarch64-pc-windows-msvc": {
+      "artifactName": "baton-mcp-x86_64-pc-windows-msvc.zip",
+      "bins": {
+        "baton": "baton.exe"
+      },
+      "zipExt": ".zip"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "artifactName": "baton-mcp-aarch64-unknown-linux-gnu.tar.xz",
+      "bins": {
+        "baton": "baton"
+      },
+      "zipExt": ".tar.xz"
+    },
+    "x86_64-apple-darwin": {
+      "artifactName": "baton-mcp-x86_64-apple-darwin.tar.xz",
+      "bins": {
+        "baton": "baton"
+      },
+      "zipExt": ".tar.xz"
+    },
+    "x86_64-pc-windows-gnu": {
+      "artifactName": "baton-mcp-x86_64-pc-windows-msvc.zip",
+      "bins": {
+        "baton": "baton.exe"
+      },
+      "zipExt": ".zip"
+    },
+    "x86_64-pc-windows-msvc": {
+      "artifactName": "baton-mcp-x86_64-pc-windows-msvc.zip",
+      "bins": {
+        "baton": "baton.exe"
+      },
+      "zipExt": ".zip"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "artifactName": "baton-mcp-x86_64-unknown-linux-gnu.tar.xz",
+      "bins": {
+        "baton": "baton"
+      },
+      "zipExt": ".tar.xz"
+    }
+  },
+  "version": "0.2.0",
+  "volta": {
+    "node": "18.14.1",
+    "npm": "9.5.0"
+  },
+  "mcpName": "tech.kasabeh/baton"
+}

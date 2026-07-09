@@ -1,18 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
-  "name": "io.github.kaseban/baton",
-  "description": "Pass the baton between coding agents. Convert sessions between Claude Code, OpenCode, Codex, Gemini CLI, Zed, Aider, Cursor, Continue, and Cline — list, convert, and import them as MCP tools.",
+  "name": "tech.kasabeh/baton",
+  "description": "Pass the baton between coding agents: convert sessions across Claude Code, OpenCode, Codex & more.",
   "repository": {
     "url": "https://github.com/Kaseban/baton",
     "source": "github"
   },
-  "version": "0.1.1",
+  "version": "0.2.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "@kasabeh/baton-mcp",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"

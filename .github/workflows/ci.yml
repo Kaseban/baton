@@ -9,6 +9,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  version-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-version-sync.sh
+
   check:
     runs-on: ${{ matrix.os }}
     strategy:
