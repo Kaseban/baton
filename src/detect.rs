@@ -149,25 +149,15 @@ pub fn detect_at_path(path: &std::path::Path) -> Agent {
         return Agent::Opencode;
     }
 
-    // Heuristic: read file content and look for patterns.
+    // Heuristic: read file content and detect by *structure*, never by substring
+    // search over the whole file. Transcripts of coding sessions routinely contain
+    // other agents' markers (e.g. "ses_", "#### USER") inside message text, so
+    // substring sniffing misdetects. Parse and check top-level shape instead.
     if path.is_file()
-        && let Ok(content) = std::fs::read_to_string(path) {
-            // Claude Code: JSONL with "type":"user"/"assistant" + "message":{"role"
-            if content.contains("\"leafUuid\"") || content.contains("\"sessionId\"") {
-                return Agent::ClaudeCode;
+        && let Ok(content) = std::fs::read_to_string(path)
+            && let Some(agent) = sniff_structure(&content) {
+                return agent;
             }
-            // OpenCode: JSON with "sessionID" or "msg_" / "prt_" prefixes
-            if content.contains("\"sessionID\"") || content.contains("ses_") {
-                return Agent::Opencode;
-            }
-            // Aider: native history starts "# aider chat started at"; baton writes #### USER headers
-            if content.contains("# aider chat started at")
-                || content.contains("#### USER")
-                || content.contains("#### ASSISTANT")
-            {
-                return Agent::Aider;
-            }
-        }
 
     // Filename patterns
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -182,6 +172,68 @@ pub fn detect_at_path(path: &std::path::Path) -> Agent {
     }
 
     Agent::Unknown
+}
+
+/// Structural content sniffing: parse JSON/JSONL and inspect top-level shape.
+/// Returns None when the content doesn't match any known session structure.
+fn sniff_structure(content: &str) -> Option<Agent> {
+    // JSONL formats: judge by the first non-empty line.
+    let first_line = content.lines().find(|l| !l.trim().is_empty())?;
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(first_line.trim())
+        && let Some(obj) = v.as_object() {
+            // Codex rollout: {"timestamp":..,"type":"session_meta","payload":{..}}
+            if obj.get("type").and_then(|t| t.as_str()) == Some("session_meta")
+                && obj.contains_key("payload")
+            {
+                return Some(Agent::Codex);
+            }
+            // Claude Code JSONL: top-level sessionId/leafUuid on each record.
+            if obj.contains_key("sessionId") || obj.contains_key("leafUuid") {
+                return Some(Agent::ClaudeCode);
+            }
+            // OpenCode export: {"info":{"id":"ses_.."},"messages":[..]} (single JSON,
+            // but a compact export fits on one line).
+            if obj.contains_key("info") && obj.contains_key("messages") {
+                return Some(Agent::Opencode);
+            }
+        }
+    // Whole-file JSON (pretty-printed documents span many lines).
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+        match &v {
+            serde_json::Value::Array(items) => {
+                if let Some(first) = items.iter().find_map(|i| i.as_object()) {
+                    // Gemini checkpoint: [{"role":"user","parts":[..]}, ..]
+                    if first.contains_key("role") && first.contains_key("parts") {
+                        return Some(Agent::GeminiCli);
+                    }
+                    // Zed thread: [{"User":{..}} | {"Agent":{..}}, ..]
+                    if first.len() == 1
+                        && first
+                            .keys()
+                            .all(|k| k == "User" || k == "Agent" || k == "System")
+                    {
+                        return Some(Agent::Zed);
+                    }
+                }
+            }
+            serde_json::Value::Object(obj)
+                if obj.contains_key("info") && obj.contains_key("messages") => {
+                    return Some(Agent::Opencode);
+                }
+            _ => {}
+        }
+    }
+    // Aider markdown history: anchor to leading lines, never substring-anywhere —
+    // transcripts about aider legitimately contain these markers mid-file.
+    if content.starts_with("# aider chat started at")
+        || content
+            .lines()
+            .take(5)
+            .any(|l| l == "#### USER" || l == "#### ASSISTANT")
+    {
+        return Some(Agent::Aider);
+    }
+    None
 }
 
 /// The command we register as the MCP server invocation.
@@ -227,6 +279,59 @@ mod tests {
         let claude = dir.join("c.txt");
         std::fs::write(&claude, r#"{"sessionId":"x","type":"user"}"#).unwrap();
         assert_eq!(detect_at_path(&claude), Agent::ClaudeCode);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Transcripts *about* coding agents contain other agents' markers ("ses_",
+    /// "#### USER", "sessionID") inside message text. Detection must key on
+    /// structure, not substrings anywhere in the file.
+    #[test]
+    fn content_sniffing_adversarial() {
+        let dir =
+            std::env::temp_dir().join(format!("baton-detect-adv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Codex rollout whose payload text mentions opencode markers.
+        let codex = dir.join("rollout.jsonl");
+        std::fs::write(
+            &codex,
+            concat!(
+                r#"{"timestamp":"2026-07-06T02:31:14.245Z","type":"session_meta","payload":{"id":"x","instructions":null}}"#,
+                "\n",
+                r#"{"timestamp":"2026-07-06T02:31:15.000Z","type":"response_item","payload":{"type":"message","content":[{"type":"input_text","text":"the id is ses_abc and \"sessionID\" and #### USER"}]}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(detect_at_path(&codex), Agent::Codex);
+
+        // Gemini checkpoint whose text mentions ses_ / aider headers.
+        let gemini = dir.join("checkpoint.json");
+        std::fs::write(
+            &gemini,
+            r#"[{"role":"user","parts":[{"text":"ses_123 and #### ASSISTANT"}]},{"role":"model","parts":[{"text":"ok"}]}]"#,
+        )
+        .unwrap();
+        assert_eq!(detect_at_path(&gemini), Agent::GeminiCli);
+
+        // Zed thread mentioning opencode session ids.
+        let zed = dir.join("thread.json");
+        std::fs::write(
+            &zed,
+            r#"[{"User":{"content":[{"Text":{"text":"see ses_999"}}]}},{"Agent":{"content":[{"Text":{"text":"ok"}}]}}]"#,
+        )
+        .unwrap();
+        assert_eq!(detect_at_path(&zed), Agent::Zed);
+
+        // OpenCode export still detected structurally.
+        let oc = dir.join("export.json");
+        std::fs::write(
+            &oc,
+            r#"{"info":{"id":"ses_b1112df89652457ba15437c4"},"messages":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(detect_at_path(&oc), Agent::Opencode);
 
         std::fs::remove_dir_all(&dir).ok();
     }
