@@ -23,8 +23,10 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      # npm >= 11.5.1 required for trusted publishing
-      - run: npm install -g npm@latest
+      # npm >= 11.5.1 required for trusted publishing.
+      # Pinned (not @latest): npm@latest has shipped broken (missing sigstore
+      # module -> MODULE_NOT_FOUND during provenance) on hosted runners.
+      - run: npm install -g npm@11.5.1
       - name: Verify npm/ version matches release tag
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
