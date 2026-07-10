@@ -19,6 +19,6 @@ jobs:
           echo "$PAYLOAD" | base64 -d 2>/dev/null | jq '{workflow, workflow_ref, job_workflow_ref, repository, repository_owner, ref, event_name, sub, aud}'
           echo "--- exchange response ---"
           curl -s -w "\nHTTP %{http_code}\n" -X POST \
-            https://registry.npmjs.org/-/npm/v1/oidc/token/exchange \
+            "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/@kasabeh%2fbaton-mcp" \
             -H "content-type: application/json" \
             -d "{\"token\":\"$IDTOKEN\"}"
