@@ -47,13 +47,31 @@ fn default_output(session: &Session, to: Agent) -> std::path::PathBuf {
 pub fn import_to_target(to: Agent, file: &Path) -> anyhow::Result<()> {
     match to {
         Agent::Opencode => {
-            let status = std::process::Command::new("opencode")
+            use std::io::Write;
+            let out = std::process::Command::new("opencode")
                 .arg("import")
                 .arg(file)
-                .status()
+                .output()
                 .context("running `opencode import`")?;
-            if !status.success() {
-                anyhow::bail!("`opencode import` exited {status}");
+            std::io::stdout().write_all(&out.stdout).ok();
+            std::io::stderr().write_all(&out.stderr).ok();
+            if !out.status.success() {
+                anyhow::bail!("`opencode import` exited {}", out.status);
+            }
+            // opencode prints "Imported session: ses_..." — lift the id so we can
+            // hand the user a ready-to-run command instead of making them hunt.
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let id = combined
+                .split_whitespace()
+                .find(|w| w.starts_with("ses_"))
+                .map(|w| w.trim_end_matches(|c: char| !c.is_ascii_alphanumeric()));
+            match id {
+                Some(id) => eprintln!("open it with: opencode --session {id}"),
+                None => eprintln!("open it with: opencode --continue"),
             }
             Ok(())
         }
@@ -110,7 +128,10 @@ fn import_claude(file: &Path) -> anyhow::Result<()> {
     let dest = dir.join(format!("{id}.jsonl"));
     std::fs::write(&dest, contents).with_context(|| format!("writing {}", dest.display()))?;
     eprintln!("imported into {}", dest.display());
-    eprintln!("resume from {} with: claude --resume {id}", cwd.display());
+    eprintln!(
+        "open it with: claude --resume {id}   (from {})",
+        cwd.display()
+    );
     Ok(())
 }
 
@@ -148,6 +169,6 @@ fn import_codex(file: &Path) -> anyhow::Result<()> {
     std::fs::copy(file, &dest)
         .with_context(|| format!("copying to {}", dest.display()))?;
     eprintln!("imported into {}", dest.display());
-    eprintln!("resume with: codex resume {id}");
+    eprintln!("open it with: codex resume {id}");
     Ok(())
 }
