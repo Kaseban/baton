@@ -43,7 +43,7 @@ Sleep 1200ms
 Enter
 Sleep 8s
 
-Type "# session handed off — keep working in opencode ⚡"
+Type "# baton hands you the exact command — paste it and keep going ⚡"
 Sleep 800ms
 Enter
 Sleep 2500ms
