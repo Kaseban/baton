@@ -20,5 +20,5 @@ jobs:
           echo "--- exchange response ---"
           curl -s -w "\nHTTP %{http_code}\n" -X POST \
             "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/@kasabeh%2fbaton-mcp" \
-            -H "content-type: application/json" \
-            -d "{\"token\":\"$IDTOKEN\"}"
+            -H "Authorization: Bearer $IDTOKEN" \
+            -H "content-type: application/json"
