@@ -29,7 +29,8 @@ It's 4 p.m. Claude Code says **"usage limit reached — resets at 10 p.m."** You
 ✅ **With baton** — pass the session and keep going:
 
 ```sh
-baton convert --from claude-code --to opencode session.jsonl --import
+baton convert --from claude-code --to opencode --latest --import
+# using latest claude-code session: 2026-07-09 15:58  Refactor the auth middleware to…
 # passed baton: claude-code → opencode (1388 messages) → handoff.json
 # Imported session: ses_8c4c973a521549e2
 
@@ -44,12 +45,30 @@ Works in every direction: switch agents mid-task, try a second opinion on a hard
 # zero-install run (downloads prebuilt binary)
 npx @kasabeh/baton-mcp --help
 
-# convert + auto-import into the target agent
+# convert your most recent session + auto-import into the target agent
+baton convert --from claude-code --to opencode --latest --import
+
+# or omit the path to pick interactively — newest first,
+# each session previewed by its first user message
+baton convert --from claude-code --to opencode --import
+
+# or pass an explicit session file
 baton convert --from claude-code --to opencode <session.jsonl> --import
 
 # see every session on your machine, across all agents
 baton list
 ```
+
+### Where do session files live?
+
+You never have to hunt these down (`--latest` and the interactive picker find them for you), but for reference — each agent stores its transcripts on disk:
+
+| Agent | Location |
+|---|---|
+| Claude Code | `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl` |
+| Codex CLI | `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl` |
+
+`baton list` prints the path of every session it can find, across all agents.
 
 ## Supported formats
 
@@ -150,6 +169,10 @@ cargo build --release
 Each format lives in `src/formats/<name>.rs` and implements the `Format` trait (read + write). See `src/formats/claude_code.rs` for a complete reference implementation.
 
 All nine formats have readers; Claude Code, OpenCode, Codex, Zed, Aider, and Gemini CLI also have writers. The most impactful contribution now is a **writer** for Continue.
+
+### Regenerating the demo
+
+The README GIF is scripted with [VHS](https://github.com/charmbracelet/vhs): `vhs assets/demo.tape`. It records against a sandboxed `$HOME` (`/tmp/demo`) populated with fabricated sessions, so no real session data ends up in the GIF.
 
 Don't drop the baton.
 

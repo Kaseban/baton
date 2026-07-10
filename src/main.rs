@@ -7,6 +7,7 @@ mod config;
 mod convert;
 mod detect;
 mod formats;
+mod pick;
 
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -36,14 +37,17 @@ enum Cmd {
         /// Target agent.
         #[arg(long, value_parser = parse_agent)]
         to: Agent,
-        /// Input session file path.
-        input: PathBuf,
+        /// Input session file path. Omit to pick one interactively (or use --latest).
+        input: Option<PathBuf>,
         /// Output file path (defaults to ./<to>-<source_id>.<ext>).
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// After writing, run the target agent's own import command (e.g. `opencode import`).
         #[arg(long)]
         import: bool,
+        /// Use the source agent's most recently modified session (skips the picker).
+        #[arg(long, conflicts_with = "input")]
+        latest: bool,
     },
     /// List sessions from one or all agents.
     List {
@@ -80,7 +84,12 @@ fn main() -> anyhow::Result<()> {
             input,
             output,
             import,
+            latest,
         } => {
+            let input = match input {
+                Some(p) => p,
+                None => pick::resolve_input(from, latest)?,
+            };
             let out = convert::convert(from, to, &input, output.as_deref())?;
             if import {
                 convert::import_to_target(to, &out)?;

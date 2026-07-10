@@ -1,9 +1,11 @@
 # baton demo — regenerate with: vhs assets/demo.tape
+# Records against a sandboxed $HOME with fabricated sessions so no real
+# session data appears in the GIF (see README "Regenerating the demo").
 Output assets/demo.gif
 
-Set FontSize 20
+Set FontSize 18
 Set Width 1200
-Set Height 520
+Set Height 720
 Set Padding 24
 Set Margin 20
 Set MarginFill "#6C40D8"
@@ -13,7 +15,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 45ms
 
 Hide
-Type "cd ~/demo && rm -f handoff.json && clear"
+Type `export HOME=/tmp/demo && export PATH="/Users/mehranmeidani/Projects/kaseban-projects/baton/target/release:$PATH" && cd $HOME && rm -f opencode-*.json`
 Enter
 Sleep 500ms
 Type `clear && printf ' \e[1;95mbaton\e[0m \e[2m—\e[0m pass coding-agent sessions between tools\n'`
@@ -26,10 +28,18 @@ Sleep 800ms
 Enter
 Sleep 400ms
 
-Type "baton convert --from claude-code --to opencode \"
+Type "# No path needed — baton finds your sessions:"
+Sleep 800ms
 Enter
-Type "  session.jsonl -o handoff.json --import"
+Sleep 400ms
+
+Type "baton convert --from claude-code --to opencode --import"
 Sleep 900ms
+Enter
+Sleep 3s
+
+Type "2"
+Sleep 1200ms
 Enter
 Sleep 8s
 
