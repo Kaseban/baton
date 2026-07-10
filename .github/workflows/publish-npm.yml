@@ -19,10 +19,13 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      # NOTE: no registry-url here. setup-node's registry-url writes an .npmrc
+      # with _authToken=${NODE_AUTH_TOKEN} (placeholder "XXXXX" when unset),
+      # which npm sends as a bogus bearer token instead of doing the OIDC
+      # trusted-publishing exchange -> E404 on PUT.
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
       # npm >= 11.5.1 required for trusted publishing.
       # Pinned (not @latest): npm@latest has shipped broken (missing sigstore
       # module -> MODULE_NOT_FOUND during provenance) on hosted runners.
