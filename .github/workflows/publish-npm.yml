@@ -1,0 +1,38 @@
+# Custom publish job invoked by dist's release.yml (publish-jobs = ["./publish-npm"]).
+# Publishes the hand-maintained npm/ package via npm Trusted Publishing (OIDC) —
+# no NPM_TOKEN, no OTP. One-time setup on npmjs.com: package Settings →
+# Trusted Publisher → GitHub Actions → repo Kaseban/baton, workflow release.yml.
+name: publish-npm
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  npm:
+    runs-on: ubuntu-22.04
+    permissions:
+      id-token: write # required for OIDC trusted publishing
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # npm >= 11.5.1 required for trusted publishing
+      - run: npm install -g npm@latest
+      - name: Verify npm/ version matches release tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./npm/package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "npm/package.json ($PKG_VERSION) != tag ($TAG_VERSION)" >&2
+            exit 1
+          fi
+      - name: Publish to npm
+        working-directory: npm
+        run: npm publish --provenance --access public
