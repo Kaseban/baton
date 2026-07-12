@@ -146,6 +146,11 @@ impl Format for Opencode {
         // ToolResult arriving in a later message folds into that part's state.
         let mut tool_locs: std::collections::HashMap<String, (usize, usize)> =
             std::collections::HashMap::new();
+        // Rough usage estimates (~4 chars/token): opencode's UI expects real
+        // numbers here, and all-zero usage on every message reads as a session
+        // that never produced anything.
+        let mut context_tokens: u64 = 0;
+        let mut total_output: u64 = 0;
         for msg in &session.messages {
             let msg_id = format!("msg_{}", &Uuid::new_v4().simple().to_string()[..24]);
             let ts = msg.time_created;
@@ -162,6 +167,8 @@ impl Format for Opencode {
                 }),
                 Role::Assistant => {
                     let pid = prev_id.clone().unwrap_or_else(|| msg_id.clone());
+                    let out_tok = estimate_tokens(&msg.parts);
+                    total_output += out_tok;
                     serde_json::json!({
                         "id": msg_id,
                         "sessionID": session_id,
@@ -175,14 +182,15 @@ impl Format for Opencode {
                         "path": { "cwd": cwd, "root": cwd },
                         "cost": 0,
                         "tokens": {
-                            "input": 0,
-                            "output": 0,
+                            "input": context_tokens,
+                            "output": out_tok,
                             "reasoning": 0,
                             "cache": { "read": 0, "write": 0 }
                         },
                     })
                 }
             };
+            context_tokens += estimate_tokens(&msg.parts);
 
             let mut parts_json: Vec<serde_json::Value> = Vec::new();
             let mut first_text = true;
@@ -302,7 +310,12 @@ impl Format for Opencode {
                 "version": env!("CARGO_PKG_VERSION"),
                 "summary": { "additions": 0, "deletions": 0, "files": 0 },
                 "cost": 0,
-                "tokens": { "input": 0, "output": 0, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+                "tokens": {
+                    "input": context_tokens.saturating_sub(total_output),
+                    "output": total_output,
+                    "reasoning": 0,
+                    "cache": { "read": 0, "write": 0 }
+                },
                 "time": {
                     "created": if session.time_created > 0 { session.time_created } else { now },
                     "updated": if session.time_updated > 0 { session.time_updated } else { now },
@@ -316,6 +329,22 @@ impl Format for Opencode {
             .with_context(|| format!("writing {}", out_path.display()))?;
         Ok(())
     }
+}
+
+/// Rough token estimate for a message's parts (~4 chars per token).
+fn estimate_tokens(parts: &[Part]) -> u64 {
+    let chars: usize = parts
+        .iter()
+        .map(|p| match p {
+            Part::Text { text } | Part::Reasoning { text } => text.len(),
+            Part::ToolCall { input, .. } => {
+                input.as_ref().map(|v| v.to_string().len()).unwrap_or(0)
+            }
+            Part::ToolResult { output, .. } => output.as_ref().map(|s| s.len()).unwrap_or(0),
+            Part::Attachment { .. } => 0,
+        })
+        .sum();
+    (chars / 4) as u64
 }
 
 fn slugify(s: &str) -> String {

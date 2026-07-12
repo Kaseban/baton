@@ -264,6 +264,9 @@ fn parse_content(content: &serde_json::Value) -> (Vec<Part>, bool) {
                                 .map(|s| s.to_string());
                             let output = match block.get("content") {
                                 Some(serde_json::Value::String(s)) => Some(s.clone()),
+                                Some(serde_json::Value::Array(blocks)) => {
+                                    Some(flatten_tool_result_content(blocks))
+                                }
                                 Some(other) => Some(other.to_string()),
                                 None => None,
                             };
@@ -284,6 +287,37 @@ fn parse_content(content: &serde_json::Value) -> (Vec<Part>, bool) {
         _ => {}
     }
     (parts, has_content)
+}
+
+/// Claude tool_result content arrays mix text and image blocks. Join the text
+/// blocks and replace images with a short placeholder — inlining the base64
+/// (what a raw `to_string()` did) blows the part up by megabytes and chokes
+/// target agents. Unknown block types fall back to their JSON form.
+fn flatten_tool_result_content(blocks: &[serde_json::Value]) -> String {
+    blocks
+        .iter()
+        .map(|b| match b.get("type").and_then(|v| v.as_str()) {
+            Some("text") => b
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            Some("image") => {
+                let media = b
+                    .pointer("/source/media_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image");
+                let kb = b
+                    .pointer("/source/data")
+                    .and_then(|v| v.as_str())
+                    .map(|d| d.len() * 3 / 4 / 1024)
+                    .unwrap_or(0);
+                format!("[image omitted: {media}, ~{kb} KB]")
+            }
+            _ => b.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_meta_user(text: &str) -> bool {

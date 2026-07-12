@@ -48,6 +48,9 @@ enum Cmd {
         /// Use the source agent's most recently modified session (skips the picker).
         #[arg(long, conflicts_with = "input")]
         latest: bool,
+        /// Lossy: strip all tool calls and tool outputs to shrink the converted session.
+        #[arg(long)]
+        compress: bool,
     },
     /// List sessions from one or all agents.
     List {
@@ -85,12 +88,13 @@ fn main() -> anyhow::Result<()> {
             output,
             import,
             latest,
+            compress,
         } => {
             let input = match input {
                 Some(p) => p,
                 None => pick::resolve_input(from, latest)?,
             };
-            let out = convert::convert(from, to, &input, output.as_deref())?;
+            let out = convert::convert(from, to, &input, output.as_deref(), compress)?;
             if import {
                 convert::import_to_target(to, &out)?;
             }
