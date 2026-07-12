@@ -19,7 +19,7 @@
       "hasInstallScript": true,
       "license": "MIT OR Apache-2.0",
       "name": "@kasabeh/baton-mcp",
-      "version": "0.2.1"
+      "version": "0.3.0"
     },
     "node_modules/detect-libc": {
       "engines": {
@@ -48,5 +48,5 @@
     }
   },
   "requires": true,
-  "version": "0.2.1"
+  "version": "0.3.0"
 }
