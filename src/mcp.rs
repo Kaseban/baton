@@ -154,6 +154,9 @@ pub fn serve() -> anyhow::Result<()> {
             if !state.opt_in.contains(&key) {
                 state.opt_in.push(key.clone());
             }
+            // Re-arm a death that fired before the opt-in, so `watch --auto`
+            // picks it up on the next scan instead of treating it as handled.
+            state.handled.remove(&key);
             match state.save() {
                 Ok(()) => format!("opted in: {key}"),
                 Err(e) => format!("error: {e:#}"),

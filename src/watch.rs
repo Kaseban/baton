@@ -167,13 +167,17 @@ fn scan(project: &Path, opts: &WatchOpts) -> anyhow::Result<()> {
         }
     }
     // Every surfaced death is marked handled — chosen or skipped — so one error
-    // event prompts exactly once. A *new* error event on the same session refires.
+    // event prompts exactly once. A *new* error event on the same session refires,
+    // and failover_opt_in clears the entry so opting in after a death re-arms it.
+    // Merge into freshly-loaded state: an opt-in written by the MCP tool while we
+    // were scanning must not be clobbered by our stale copy.
+    let mut fresh = State::load();
     for d in &dead {
-        state
+        fresh
             .handled
             .insert(State::key(d.agent, &d.session_id), d.error_id.clone());
     }
-    state.save()
+    fresh.save()
 }
 
 /// Interactive selection. Accepts "a" (all), "s" (skip), or comma-separated numbers.
@@ -395,11 +399,11 @@ fn scan_opencode(project: &Path) -> Vec<Dead> {
     let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
         return Vec::new();
     };
-    let project = project.to_string_lossy();
+    let project = normalize_dir(&project.to_string_lossy());
     let mut dead = Vec::new();
     for row in rows {
         let dir = row.get("dir").and_then(|d| d.as_str()).unwrap_or("");
-        if dir != project {
+        if normalize_dir(dir) != project {
             continue;
         }
         let Some(data) = row
@@ -428,6 +432,15 @@ fn scan_opencode(project: &Path) -> Vec<Dead> {
         }
     }
     dead
+}
+
+/// Directory strings comparable across sources: strip Windows' verbatim
+/// `\\?\` prefix (canonicalize adds it; opencode doesn't) and trailing separators.
+fn normalize_dir(s: &str) -> String {
+    s.strip_prefix(r"\\?\")
+        .unwrap_or(s)
+        .trim_end_matches(['/', '\\'])
+        .to_string()
 }
 
 /// Limit-shaped error on an opencode assistant message, if any.
@@ -561,6 +574,13 @@ mod tests {
 
         assert_eq!(back.opt_in, vec!["claude-code:abc"]);
         assert_eq!(back.handled.get("opencode:ses_1").map(String::as_str), Some("msg_9"));
+    }
+
+    #[test]
+    fn normalize_dir_strips_verbatim_prefix_and_trailing_seps() {
+        assert_eq!(normalize_dir(r"\\?\C:\work\proj\"), r"C:\work\proj");
+        assert_eq!(normalize_dir("/Users/x/proj/"), "/Users/x/proj");
+        assert_eq!(normalize_dir("/Users/x/proj"), "/Users/x/proj");
     }
 
     #[test]
