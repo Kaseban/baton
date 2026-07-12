@@ -133,7 +133,7 @@ pub fn run(opts: WatchOpts) -> anyhow::Result<()> {
 }
 
 fn scan(project: &Path, opts: &WatchOpts) -> anyhow::Result<()> {
-    let mut state = State::load();
+    let state = State::load();
     let mut dead = scan_claude(project);
     dead.extend(scan_opencode(project));
     dead.retain(|d| {
