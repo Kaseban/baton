@@ -67,10 +67,12 @@ supposed to save.
 
 ## Caveats
 
-- lg/baton's 3 misses: two answers where the model role-played needing file
-  permissions despite the "inert record" instruction, and one mid-stream API
-  stall — harness noise, not conversion loss (the facts are present in the
-  transcript).
+- lg/baton is unstable run-to-run (5/8 published; a verification re-run got
+  1/8). Every miss is the same failure mode: the model role-plays needing
+  file/sandbox permissions despite the "inert record" instruction, instead of
+  answering from the transcript in its context. Harness noise, not conversion
+  loss (the facts are present in the transcript). sm and md reproduce exactly.
+  Treat lg/baton as a lower bound until the quiz prompt pins the agent harder.
 - Grading is substring match against hand-picked ground truth; regenerate the
   slices and expected answers if the source session changes.
 - Single session, single model — directional, not a paper.
