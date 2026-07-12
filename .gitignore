@@ -12,3 +12,4 @@ benchmark/handoff-*.md
 benchmark/converted-*
 benchmark/__pycache__/
 launch/
+benchmark/continuation-*.md

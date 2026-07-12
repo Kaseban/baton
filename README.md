@@ -101,6 +101,8 @@ Does carrying the full transcript beat writing a handoff summary for the next ag
 
 The summary lost concrete facts (versions, line counts, MSRV) even on the smallest slice — the receiving agent had to re-read files and re-run commands to rediscover them. Mechanical fidelity: all 896 messages are written to every target; round-trip loss reflects each target format's expressiveness (claude-code 896/896, codex 736, gemini-cli 723, aider 111 — it stores chat text only).
 
+We also measured **task continuation**: cut the session at three mid-task points, ask a fresh agent to state the task, state, and next steps. Result: parity (baton 10/12, handoff 10/12) — a good summary is enough for *what to do next*; the transcript is what answers the *specific factual questions* the summary's author didn't anticipate. And the summary only exists if an agent spends a full transcript read writing it — baton makes the transfer free.
+
 Full methodology, caveats, and reproduction steps: [benchmark/RESULTS.md](benchmark/RESULTS.md).
 
 ## MCP server

@@ -65,6 +65,33 @@ by discarding them — and the receiving agent then re-reads files and re-runs
 commands to rediscover what was discarded, which is the work the summary was
 supposed to save.
 
+## Angle 5: Task continuation
+
+Recall trivia is a proxy. The day-to-day question is: can the next agent
+*keep working*? We cut the real session at three known mid-task points,
+gave a fresh agent either the baton transcript (tail-clamped to ~100K
+tokens) or a handoff summary written from the same window, and asked it to
+state the task, current state, and concrete next steps (no tools — so
+failures are knowledge failures, not sandbox role-play). Graded against a
+checklist of facts the next agent needs to proceed.
+
+| cut point | arm | context tokens (est) | needed facts present |
+|---|---|---:|---:|
+| audit-done | baton | 38,151 | 4/4 |
+| audit-done | handoff | 725 | 4/4 |
+| benchmark-mid | baton | 100,000 | 3/4 |
+| benchmark-mid | handoff | 338 | 3/4 |
+| release-mid | baton | 100,000 | 3/4 |
+| release-mid | handoff | 348 | 3/4 |
+
+**Honest finding: parity.** For "what do I do next?", a well-written summary
+is enough — both arms scored 10/12, missing the same items. The transcript's
+advantage is in Angle 2: *specific facts on demand* mid-work (14/17 vs 3/17).
+So the fair pitch is not "transcript beats summary at everything"; it's:
+(a) the summary only exists if someone spends a full transcript read writing
+it — baton gives the transfer for free; and (b) the summary answers the
+questions its author anticipated, the transcript answers the ones they didn't.
+
 ## Caveats
 
 - lg/baton is unstable run-to-run (5/8 published; a verification re-run got
@@ -76,13 +103,20 @@ supposed to save.
 - Grading is substring match against hand-picked ground truth; regenerate the
   slices and expected answers if the source session changes.
 - Single session, single model — directional, not a paper.
+- Continuation transcripts are tail-clamped to fit context; the handoff is
+  written from the same window, so both arms see identical information. Both
+  missed the same 2/24 checklist items (facts outside the window or phrased
+  differently) — a window artifact, not an arm difference.
 
 ## Reproduce
 
 ```sh
 cargo build
-python3 benchmark/bench.py   # needs `claude` CLI on PATH
+python3 benchmark/bench.py          # fidelity matrix + recall quiz (~40 LLM calls)
+python3 benchmark/continuation.py   # mid-task continuation eval (~9 LLM calls)
 ```
 
 `bench.py` regenerates the fidelity matrix mechanically and re-runs the
-recall quiz (the recall arm makes ~40 LLM calls).
+recall quiz. `continuation.py` re-runs the mid-task cut-point eval; cut line
+numbers are pinned to this specific session — re-pick them if the source
+session changes.
