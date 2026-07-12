@@ -1,6 +1,6 @@
 {
   "artifactDownloadUrls": [
-    "https://github.com/Kaseban/baton/releases/download/v0.3.0"
+    "https://github.com/Kaseban/baton/releases/download/v0.4.0"
   ],
   "bin": {
     "baton": "run-baton.js"
@@ -91,7 +91,7 @@
       "zipExt": ".tar.xz"
     }
   },
-  "version": "0.3.0",
+  "version": "0.4.0",
   "volta": {
     "node": "18.14.1",
     "npm": "9.5.0"
