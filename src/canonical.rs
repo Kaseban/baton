@@ -162,6 +162,17 @@ impl Session {
         self.messages.len()
     }
 
+    /// Lossy shrink for `convert --compress`: drop every tool call and tool
+    /// result, keeping only text/reasoning/attachments. Messages left with no
+    /// parts are removed entirely.
+    pub fn compress(&mut self) {
+        for msg in &mut self.messages {
+            msg.parts
+                .retain(|p| !matches!(p, Part::ToolCall { .. } | Part::ToolResult { .. }));
+        }
+        self.messages.retain(|m| !m.parts.is_empty());
+    }
+
     pub fn first_user_text(&self) -> Option<&str> {
         self.messages
             .iter()

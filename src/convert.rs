@@ -13,9 +13,19 @@ pub fn convert(
     to: Agent,
     input: &Path,
     output: Option<&Path>,
+    compress: bool,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let session = formats::read(from, input)
+    let mut session = formats::read(from, input)
         .with_context(|| format!("reading {} session", from))?;
+    if compress {
+        let before = session.message_count();
+        session.compress();
+        eprintln!(
+            "compressed: stripped tool calls/outputs ({} → {} messages)",
+            before,
+            session.message_count()
+        );
+    }
     let out = output
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| default_output(&session, to));

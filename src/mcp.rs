@@ -95,6 +95,7 @@ pub fn serve() -> anyhow::Result<()> {
                 to,
                 std::path::Path::new(&p.input),
                 p.output.as_deref().map(std::path::Path::new),
+                false,
             ) {
                 Ok(out) => format!("ok: wrote {}", out.display()),
                 Err(e) => format!("error: {e:#}"),
