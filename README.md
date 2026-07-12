@@ -113,12 +113,41 @@ baton is also an MCP server — your agent can pass the baton itself, mid-conver
 | `convert_session` | Convert a session from one format to another |
 | `import_to_target` | Convert + run the target agent's import command |
 | `detect_format` | Sniff a file/dir and report which agent produced it |
+| `failover_opt_in` | Allowlist a session for unattended failover (see below) |
+| `failover_opt_out` | Remove a session from the failover allowlist |
+| `failover_status` | List sessions opted in to unattended failover |
 
 ```sh
 baton install     # registers baton in every detected agent's MCP config
 baton doctor      # verify
 baton uninstall   # remove from all agents
 ```
+
+## Auto-failover
+
+Solve the 4 p.m. problem before you notice it happened. `baton watch` polls the
+current project's sessions for quota-death ("usage limit reached") and passes
+the baton for you: convert, import, and hand you a ready-to-run resume command.
+
+```sh
+cd your-project
+baton watch                  # interactive: lists quota-dead sessions, you pick
+baton watch --auto           # unattended: fails over opted-in sessions, no prompt
+baton watch --once --auto    # single scan (wire it into an agent hook)
+baton watch --to codex       # override the failover target
+```
+
+Quota is account-level — when it dies, *every* active session errors at once, so
+failing all of them over would be spam. Interactive mode lets you pick at fire
+time; `--auto` only touches sessions you've allowlisted by telling your agent
+mid-conversation:
+
+> opt this session into failover
+
+which calls the `failover_opt_in` MCP tool. Detection currently covers
+**Claude Code** (transcript tail) and **OpenCode** (via `opencode db`); the
+default failover pair is claude-code ⇄ opencode. Run `baton watch` from the
+project directory you're working in — imports land under the process cwd.
 
 ## How it works
 

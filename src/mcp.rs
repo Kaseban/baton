@@ -53,6 +53,27 @@ pub fn serve() -> anyhow::Result<()> {
         path: String,
     }
 
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct FailoverOptParams {
+        /// Agent the session belongs to (e.g. "claude-code", "opencode").
+        agent: String,
+        /// Session id. Omit to use the agent's most recently active session —
+        /// called from inside a conversation, that is the calling session.
+        #[serde(default)]
+        session_id: Option<String>,
+    }
+
+    fn resolve_session(agent: Agent, session_id: Option<String>) -> Result<String, String> {
+        if let Some(id) = session_id {
+            return Ok(id);
+        }
+        let mut refs = crate::formats::list(agent);
+        refs.sort_by_key(|r| std::cmp::Reverse(r.mtime));
+        refs.first()
+            .map(|r| r.id.clone())
+            .ok_or_else(|| format!("no {agent} sessions found"))
+    }
+
     #[tool_router]
     impl BatonServer {
         #[tool(description = "List coding-agent sessions across all detected agents, or filter by one. Returns one session per line: <agent>\\t<id>\\t<path>.")]
@@ -116,6 +137,60 @@ pub fn serve() -> anyhow::Result<()> {
             }
         }
 
+        #[tool(description = "Opt a session in to unattended failover: when `baton watch --auto` sees it die on a usage limit, it converts the transcript and resumes it on another agent. Omit session_id to opt in the calling session.")]
+        fn failover_opt_in(
+            &self,
+            Parameters(p): Parameters<FailoverOptParams>,
+        ) -> String {
+            let Some(agent) = Agent::parse(&p.agent) else {
+                return format!("unknown agent: {}", p.agent);
+            };
+            let id = match resolve_session(agent, p.session_id) {
+                Ok(id) => id,
+                Err(e) => return e,
+            };
+            let key = crate::watch::State::key(agent, &id);
+            let mut state = crate::watch::State::load();
+            if !state.opt_in.contains(&key) {
+                state.opt_in.push(key.clone());
+            }
+            match state.save() {
+                Ok(()) => format!("opted in: {key}"),
+                Err(e) => format!("error: {e:#}"),
+            }
+        }
+
+        #[tool(description = "Remove a session from unattended failover. Omit session_id to opt out the calling session.")]
+        fn failover_opt_out(
+            &self,
+            Parameters(p): Parameters<FailoverOptParams>,
+        ) -> String {
+            let Some(agent) = Agent::parse(&p.agent) else {
+                return format!("unknown agent: {}", p.agent);
+            };
+            let id = match resolve_session(agent, p.session_id) {
+                Ok(id) => id,
+                Err(e) => return e,
+            };
+            let key = crate::watch::State::key(agent, &id);
+            let mut state = crate::watch::State::load();
+            state.opt_in.retain(|k| k != &key);
+            match state.save() {
+                Ok(()) => format!("opted out: {key}"),
+                Err(e) => format!("error: {e:#}"),
+            }
+        }
+
+        #[tool(description = "List sessions opted in to unattended failover.")]
+        fn failover_status(&self) -> String {
+            let state = crate::watch::State::load();
+            if state.opt_in.is_empty() {
+                "no sessions opted in".to_string()
+            } else {
+                state.opt_in.join("\n")
+            }
+        }
+
         #[tool(description = "Sniff a session file/dir and report which coding agent produced it.")]
         fn detect_format(
             &self,
@@ -140,7 +215,7 @@ pub fn serve() -> anyhow::Result<()> {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Pass the baton between coding agents. Tools: list_sessions, convert_session, import_to_target, detect_format.",
+                "Pass the baton between coding agents. Tools: list_sessions, convert_session, import_to_target, detect_format, failover_opt_in, failover_opt_out, failover_status.",
             )
         }
     }
