@@ -88,7 +88,7 @@ impl Format for Zed {
                             }
                             ZedAgentContent::Thinking { text, .. } => {
                                 if !text.is_empty() {
-                                    parts.push(Part::Reasoning { text: text.clone() });
+                                    parts.push(Part::Reasoning { text: text.clone(), signature: None });
                                 }
                             }
                             ZedAgentContent::ToolUse(tool) => {
@@ -206,7 +206,7 @@ impl Format for Zed {
                             Part::Text { text } => {
                                 content.push(serde_json::json!({ "Text": { "text": text } }));
                             }
-                            Part::Reasoning { text } => {
+                            Part::Reasoning { text, .. } => {
                                 content.push(serde_json::json!({
                                     "Thinking": { "text": text, "signature": null }
                                 }));
@@ -328,7 +328,7 @@ mod tests {
                 Message {
                     role: Role::Assistant,
                     parts: vec![
-                        Part::Reasoning { text: "hmm".into() },
+                        Part::Reasoning { text: "hmm".into(), signature: None },
                         Part::text("hi"),
                         Part::ToolCall {
                             name: "read_file".into(),
@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(back.messages[0].role, Role::User);
         assert_eq!(back.messages[0].parts[0].as_text(), Some("hello zed"));
         let asst = &back.messages[1];
-        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text } if text == "hmm")));
+        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text, .. } if text == "hmm")));
         assert!(asst.parts.iter().any(|p| matches!(p, Part::ToolCall { name, id, .. }
             if name == "read_file" && id.as_deref() == Some("tu_1"))));
         assert!(asst.parts.iter().any(|p| matches!(p, Part::ToolResult { output, .. }

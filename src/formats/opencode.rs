@@ -61,7 +61,10 @@ impl Format for Opencode {
                     }
                     "reasoning" | "reasoning.text" => {
                         if let Some(t) = &p.text {
-                            parts.push(Part::Reasoning { text: t.clone() });
+                            parts.push(Part::Reasoning {
+                                text: t.clone(),
+                                signature: p.reasoning_signature(),
+                            });
                         }
                     }
                     "tool" => {
@@ -212,14 +215,30 @@ impl Format for Opencode {
                             "messageID": msg_id,
                         }));
                     }
-                    Part::Reasoning { text } => parts_json.push(serde_json::json!({
-                        "type": "reasoning",
-                        "text": text,
-                        "time": { "start": ts, "end": ts + 1 },
-                        "id": part_id,
-                        "sessionID": session_id,
-                        "messageID": msg_id,
-                    })),
+                    Part::Reasoning { text, signature } => {
+                        let mut part = serde_json::json!({
+                            "type": "reasoning",
+                            "text": text,
+                            "time": { "start": ts, "end": ts + 1 },
+                            "id": part_id,
+                            "sessionID": session_id,
+                            "messageID": msg_id,
+                        });
+                        // The signature must go in `metadata.anthropic.signature`, NOT as a
+                        // sibling of `text`: opencode's SessionV1.ReasoningPart schema has no
+                        // top-level `signature`, and its importer decodes with Effect Schema's
+                        // default `onExcessProperty: "ignore"`, so a top-level key is silently
+                        // dropped. `metadata` is where opencode itself keeps it and where its
+                        // replay path reads it from (message-v2.ts: part.metadata?.anthropic
+                        // ?.signature). Without it Anthropic rejects the replayed thinking
+                        // block with "thinking.signature: Field required".
+                        if let Some(sig) = signature {
+                            part["metadata"] = serde_json::json!({
+                                "anthropic": { "signature": sig }
+                            });
+                        }
+                        parts_json.push(part)
+                    }
                     Part::ToolCall { name, id, input } => {
                         let call_id = id
                             .clone()
@@ -336,7 +355,7 @@ fn estimate_tokens(parts: &[Part]) -> u64 {
     let chars: usize = parts
         .iter()
         .map(|p| match p {
-            Part::Text { text } | Part::Reasoning { text } => text.len(),
+            Part::Text { text } | Part::Reasoning { text, .. } => text.len(),
             Part::ToolCall { input, .. } => {
                 input.as_ref().map(|v| v.to_string().len()).unwrap_or(0)
             }
@@ -520,6 +539,28 @@ struct ExportPart {
     call_id: Option<String>,
     #[serde(default)]
     state: Option<ExportToolState>,
+    /// Provider metadata on `type: "reasoning"` parts; opencode keeps the Anthropic
+    /// thinking signature at `metadata.anthropic.signature`.
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+    /// Tolerated legacy/top-level spelling of the signature (opencode itself never
+    /// emits this, but be liberal in what we accept).
+    #[serde(default)]
+    signature: Option<String>,
+}
+
+impl ExportPart {
+    /// Signature for a reasoning part, preferring opencode's canonical
+    /// `metadata.anthropic.signature` location.
+    fn reasoning_signature(&self) -> Option<String> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get("anthropic"))
+            .and_then(|a| a.get("signature"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .or_else(|| self.signature.clone())
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -578,7 +619,7 @@ mod tests {
                 Message {
                     role: Role::Assistant,
                     parts: vec![
-                        Part::Reasoning { text: "thinking".into() },
+                        Part::Reasoning { text: "thinking".into(), signature: None },
                         Part::ToolCall {
                             name: "Bash".into(),
                             id: Some("call_1".into()),
@@ -615,7 +656,7 @@ mod tests {
         assert_eq!(back.messages[1].role, Role::User);
         let asst = &back.messages[2];
         assert_eq!(asst.role, Role::Assistant);
-        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text } if text == "thinking")));
+        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text, .. } if text == "thinking")));
         let call = asst.parts.iter().find_map(|p| match p {
             Part::ToolCall { name, id, input } => Some((name.clone(), id.clone(), input.clone())),
             _ => None,
