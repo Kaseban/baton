@@ -139,7 +139,7 @@ impl Format for Opencode {
         // live ones, the loop never exits, and opencode re-requests with the
         // conversation ending on an assistant message -> Anthropic 400
         // "does not support assistant message prefill".
-        let mut ids = IdGen::new();
+        let mut ids = IdGen::new(now);
         let session_id = ids.next("ses", session.time_created.max(0));
         let slug = slugify(&session.title);
 
@@ -705,20 +705,50 @@ mod tests {
 struct IdGen {
     last_timestamp: i64,
     counter: u64,
+    /// Import-time "now". Generated ids are clamped to sort at or below the id a live opencode would
+    /// mint at this instant, so an imported message can never outrank the live conversation when the
+    /// session is resumed (resume happens strictly after import). See `next`.
+    now_ceiling: i64,
 }
 
 impl IdGen {
     const CHARS: &'static [u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-    fn new() -> Self {
-        Self { last_timestamp: -1, counter: 0 }
+    /// opencode's 12-hex id prefix encodes only the low 48 bits of `timestamp_ms * 0x1000 + counter`,
+    /// i.e. `timestamp_ms mod 2^36`, so the sortable id space WRAPS every `1 << 36` ms (~795 days).
+    /// An id built from a timestamp in an earlier window sorts ABOVE a fresh native id — which is
+    /// exactly what re-triggers the run-loop hang on opencode <= 1.18.4 (upstream `dev` avoids it by
+    /// comparing `time.created` first). We clamp every imported timestamp into the single window that
+    /// ends at `now_ceiling`, so it can never wrap back above a resume-time native id.
+    const WRAP_MS: i64 = 1 << 36;
+
+    fn new(now_ceiling: i64) -> Self {
+        Self { last_timestamp: -1, counter: 0, now_ceiling }
+    }
+
+    /// opencode's 12-hex, time-sortable prefix for an already-combined `timestamp_ms * 0x1000 + counter`.
+    fn encode_prefix(current: u128) -> String {
+        let mut s = String::with_capacity(12);
+        for i in 0..6 {
+            s.push_str(&format!("{:02x}", ((current >> (40 - 8 * i)) & 0xff) as u8));
+        }
+        s
     }
 
     /// `<prefix>_<12 hex time chars><14 random chars>`; monotonic for equal or
     /// out-of-order timestamps, so ordering always follows emission order.
     fn next(&mut self, prefix: &str, timestamp_ms: i64) -> String {
+        // Clamp into the single ~795-day wrap window ending at `now_ceiling` (import time): never
+        // above the ceiling, and never before the window's start (`now_ceiling` rounded down to a
+        // 2^36-ms boundary). Within that window `timestamp mod 2^36` is monotonic and always <= the
+        // ceiling's, so a native id opencode mints at resume (strictly later than import) outranks
+        // every id we emit. Timestamps older than the window collapse to its start but keep their
+        // emission order via the monotonic counter below. LIMITATION: a session spanning >~795 days,
+        // or a resume that itself crosses a wrap boundary, can't be fully ordered by id alone.
+        let window_start = self.now_ceiling - self.now_ceiling.rem_euclid(Self::WRAP_MS);
+        let clamped = timestamp_ms.clamp(window_start, self.now_ceiling);
         // Never let a stale timestamp produce a smaller id than the previous one.
-        let ts = timestamp_ms.max(self.last_timestamp);
+        let ts = clamped.max(self.last_timestamp);
         if ts != self.last_timestamp {
             self.last_timestamp = ts;
             self.counter = 0;
@@ -734,14 +764,20 @@ impl IdGen {
         let mut out = String::with_capacity(prefix.len() + 1 + 26);
         out.push_str(prefix);
         out.push('_');
-        for i in 0..6 {
-            out.push_str(&format!("{:02x}", ((current >> (40 - 8 * i)) & 0xff) as u8));
-        }
+        out.push_str(&Self::encode_prefix(current));
         let bytes = Uuid::new_v4();
         for b in bytes.as_bytes().iter().take(14) {
             out.push(Self::CHARS[(*b as usize) % 62] as char);
         }
         out
+    }
+
+    /// A fresh native opencode-style id (counter 0) as a live instance would mint at `timestamp_ms`.
+    /// Test-only: lets ordering assertions use a real native id instead of the wall clock, so they
+    /// stay stable across opencode's ~795-day id-wrap boundary.
+    #[cfg(test)]
+    fn native_like(prefix: &str, timestamp_ms: i64) -> String {
+        format!("{prefix}_{}{}", Self::encode_prefix((timestamp_ms as u128) * 0x1000), "0".repeat(14))
     }
 }
 
@@ -751,7 +787,8 @@ mod idgen_tests {
 
     #[test]
     fn ids_sort_chronologically_and_monotonically() {
-        let mut g = IdGen::new();
+        // Ceiling above the timestamps used, so the wrap-clamp doesn't interfere with this test.
+        let mut g = IdGen::new(1_700_000_002_000);
         let a = g.next("msg", 1_700_000_000_000);
         let b = g.next("msg", 1_700_000_000_000); // same ms
         let c = g.next("msg", 1_700_000_001_000); // later
@@ -764,11 +801,21 @@ mod idgen_tests {
     }
 
     #[test]
-    fn ids_outrank_older_and_are_outranked_by_newer_native_ids() {
-        // a native opencode id for "now" must sort above ids built from past timestamps
-        let mut g = IdGen::new();
-        let past = g.next("msg", 1_600_000_000_000);
-        let now = g.next("msg", chrono::Utc::now().timestamp_millis());
-        assert!(past < now);
+    fn imported_ids_never_outrank_a_native_id_minted_at_resume() {
+        // Date-INDEPENDENT: opencode's id prefix carries only `timestamp mod 2^36`, so it wraps every
+        // ~795 days; comparing against `Utc::now()` made this test fail for ~7.5 months of every
+        // 26-month cycle (a boundary was crossed 2026-08-14). Instead we fix a reference "now"
+        // mid-window and compare against a real native-style id built with the same 48-bit truncation.
+        const WRAP: i64 = 1 << 36;
+        let now = 100 * WRAP + WRAP / 2; // mid wrap-window, far from any boundary
+        let mut g = IdGen::new(now);
+        // An id from a PREVIOUS wrap window (which naively sorts ABOVE `now`) must be clamped below it.
+        let ancient = g.next("msg", now - 3 * WRAP - 5_000);
+        let recent = g.next("msg", now - 60_000); // within the current window
+        // A fresh native id a live opencode would mint at resume (>= import time), counter 0.
+        let native = IdGen::native_like("msg", now);
+        assert!(recent < native, "recent import must sort below a resume-time native id: {recent} !< {native}");
+        assert!(ancient < native, "a wrapped-old import must still sort below native: {ancient} !< {native}");
+        assert!(ancient < recent, "emission order preserved across the clamp: {ancient} !< {recent}");
     }
 }
