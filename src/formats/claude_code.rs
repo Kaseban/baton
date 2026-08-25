@@ -239,6 +239,12 @@ fn parse_content(content: &serde_json::Value) -> (Vec<Part>, bool) {
                             if let Some(text) = block.get("thinking").and_then(|v| v.as_str()) {
                                 parts.push(Part::Reasoning {
                                     text: text.to_string(),
+                                    // Anthropic requires this to be echoed back verbatim when
+                                    // the block is replayed in a later request; never drop it.
+                                    signature: block
+                                        .get("signature")
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string),
                                 });
                                 has_content = true;
                             }
@@ -357,7 +363,14 @@ fn parts_to_claude_content(parts: &[Part]) -> serde_json::Value {
         .iter()
         .map(|p| match p {
             Part::Text { text } => serde_json::json!({"type":"text","text":text}),
-            Part::Reasoning { text } => serde_json::json!({"type":"thinking","thinking":text}),
+            Part::Reasoning { text, signature } => {
+                let mut block = serde_json::json!({"type":"thinking","thinking":text});
+                // Round-trip the provider signature so the block stays replayable.
+                if let Some(sig) = signature {
+                    block["signature"] = serde_json::Value::String(sig.clone());
+                }
+                block
+            }
             Part::ToolCall { name, id, input } => serde_json::json!({
                 "type":"tool_use",
                 "id": id.clone().unwrap_or_else(|| format!("toolu_{}", uuid::Uuid::new_v4().simple())),
@@ -415,7 +428,7 @@ mod tests {
         assert_eq!(s.time_created, 1704067200000);
         let asst = &s.messages[1];
         assert_eq!(asst.role, Role::Assistant);
-        assert!(matches!(&asst.parts[0], Part::Reasoning { text } if text == "hmm"));
+        assert!(matches!(&asst.parts[0], Part::Reasoning { text, .. } if text == "hmm"));
         assert!(matches!(&asst.parts[2], Part::ToolCall { name, id, .. } if name == "Bash" && id.as_deref() == Some("toolu_1")));
         assert!(matches!(&s.messages[2].parts[0], Part::ToolResult { id, output, .. } if id.as_deref() == Some("toolu_1") && output.as_deref() == Some("file.txt")));
     }

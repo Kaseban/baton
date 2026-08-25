@@ -61,7 +61,10 @@ impl Format for Opencode {
                     }
                     "reasoning" | "reasoning.text" => {
                         if let Some(t) = &p.text {
-                            parts.push(Part::Reasoning { text: t.clone() });
+                            parts.push(Part::Reasoning {
+                                text: t.clone(),
+                                signature: p.reasoning_signature(),
+                            });
                         }
                     }
                     "tool" => {
@@ -128,7 +131,16 @@ impl Format for Opencode {
             session.directory.as_deref().unwrap_or(&default_dir),
         );
         let now = chrono::Utc::now().timestamp_millis();
-        let session_id = format!("ses_{}", &Uuid::new_v4().simple().to_string()[..24]);
+        // Identifiers must be TIME-SORTABLE, not random: opencode's run loop decides
+        // whether a turn is finished with a raw lexicographic comparison of message
+        // ids (`lastUser.id < lastAssistant.id`, packages/opencode/src/session/
+        // prompt.ts), and `MessageV2.latest()` picks the "last" message the same way.
+        // Random uuids break that ordering, so an imported message can outrank the
+        // live ones, the loop never exits, and opencode re-requests with the
+        // conversation ending on an assistant message -> Anthropic 400
+        // "does not support assistant message prefill".
+        let mut ids = IdGen::new(now);
+        let session_id = ids.next("ses", session.time_created.max(0));
         let slug = slugify(&session.title);
 
         let mut out_messages = Vec::with_capacity(session.messages.len());
@@ -152,7 +164,7 @@ impl Format for Opencode {
         let mut context_tokens: u64 = 0;
         let mut total_output: u64 = 0;
         for msg in &session.messages {
-            let msg_id = format!("msg_{}", &Uuid::new_v4().simple().to_string()[..24]);
+            let msg_id = ids.next("msg", msg.time_created.max(0));
             let ts = msg.time_created;
             let msg_info: serde_json::Value = match msg.role {
                 // opencode only accepts user/assistant; system messages are written as
@@ -195,7 +207,7 @@ impl Format for Opencode {
             let mut parts_json: Vec<serde_json::Value> = Vec::new();
             let mut first_text = true;
             for p in &msg.parts {
-                let part_id = format!("prt_{}", &Uuid::new_v4().simple().to_string()[..24]);
+                let part_id = ids.next("prt", msg.time_created.max(0));
                 match p {
                     Part::Text { text } => {
                         let text = if msg.role == Role::System && first_text {
@@ -212,14 +224,30 @@ impl Format for Opencode {
                             "messageID": msg_id,
                         }));
                     }
-                    Part::Reasoning { text } => parts_json.push(serde_json::json!({
-                        "type": "reasoning",
-                        "text": text,
-                        "time": { "start": ts, "end": ts + 1 },
-                        "id": part_id,
-                        "sessionID": session_id,
-                        "messageID": msg_id,
-                    })),
+                    Part::Reasoning { text, signature } => {
+                        let mut part = serde_json::json!({
+                            "type": "reasoning",
+                            "text": text,
+                            "time": { "start": ts, "end": ts + 1 },
+                            "id": part_id,
+                            "sessionID": session_id,
+                            "messageID": msg_id,
+                        });
+                        // The signature must go in `metadata.anthropic.signature`, NOT as a
+                        // sibling of `text`: opencode's SessionV1.ReasoningPart schema has no
+                        // top-level `signature`, and its importer decodes with Effect Schema's
+                        // default `onExcessProperty: "ignore"`, so a top-level key is silently
+                        // dropped. `metadata` is where opencode itself keeps it and where its
+                        // replay path reads it from (message-v2.ts: part.metadata?.anthropic
+                        // ?.signature). Without it Anthropic rejects the replayed thinking
+                        // block with "thinking.signature: Field required".
+                        if let Some(sig) = signature {
+                            part["metadata"] = serde_json::json!({
+                                "anthropic": { "signature": sig }
+                            });
+                        }
+                        parts_json.push(part)
+                    }
                     Part::ToolCall { name, id, input } => {
                         let call_id = id
                             .clone()
@@ -336,7 +364,7 @@ fn estimate_tokens(parts: &[Part]) -> u64 {
     let chars: usize = parts
         .iter()
         .map(|p| match p {
-            Part::Text { text } | Part::Reasoning { text } => text.len(),
+            Part::Text { text } | Part::Reasoning { text, .. } => text.len(),
             Part::ToolCall { input, .. } => {
                 input.as_ref().map(|v| v.to_string().len()).unwrap_or(0)
             }
@@ -520,6 +548,28 @@ struct ExportPart {
     call_id: Option<String>,
     #[serde(default)]
     state: Option<ExportToolState>,
+    /// Provider metadata on `type: "reasoning"` parts; opencode keeps the Anthropic
+    /// thinking signature at `metadata.anthropic.signature`.
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+    /// Tolerated legacy/top-level spelling of the signature (opencode itself never
+    /// emits this, but be liberal in what we accept).
+    #[serde(default)]
+    signature: Option<String>,
+}
+
+impl ExportPart {
+    /// Signature for a reasoning part, preferring opencode's canonical
+    /// `metadata.anthropic.signature` location.
+    fn reasoning_signature(&self) -> Option<String> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get("anthropic"))
+            .and_then(|a| a.get("signature"))
+            .and_then(|s| s.as_str())
+            .map(str::to_string)
+            .or_else(|| self.signature.clone())
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -578,7 +628,7 @@ mod tests {
                 Message {
                     role: Role::Assistant,
                     parts: vec![
-                        Part::Reasoning { text: "thinking".into() },
+                        Part::Reasoning { text: "thinking".into(), signature: None },
                         Part::ToolCall {
                             name: "Bash".into(),
                             id: Some("call_1".into()),
@@ -615,7 +665,7 @@ mod tests {
         assert_eq!(back.messages[1].role, Role::User);
         let asst = &back.messages[2];
         assert_eq!(asst.role, Role::Assistant);
-        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text } if text == "thinking")));
+        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text, .. } if text == "thinking")));
         let call = asst.parts.iter().find_map(|p| match p {
             Part::ToolCall { name, id, input } => Some((name.clone(), id.clone(), input.clone())),
             _ => None,
@@ -635,5 +685,137 @@ mod tests {
     fn slugify_basics() {
         assert_eq!(slugify("Hello, World!"), "hello--world");
         assert_eq!(slugify(""), "imported");
+    }
+}
+
+/// Generator for opencode-compatible, TIME-SORTABLE identifiers.
+///
+/// opencode (packages/schema/src/identifier.ts) builds ids as a 12-hex-char
+/// prefix encoding `timestamp_ms * 0x1000 + counter`, followed by 14 random
+/// characters from a 62-char alphabet. The prefix is what makes ids sort
+/// chronologically as plain strings, and opencode's run loop depends on that:
+/// it decides a turn is complete with `lastUser.id < lastAssistant.id`.
+///
+/// Emitting random uuids here instead is not merely cosmetic — roughly 2.6% of
+/// random hex ids sort ABOVE a freshly generated native id, so on a session with
+/// hundreds of messages it is effectively certain that some imported message
+/// outranks the live conversation. opencode then never exits its run loop and
+/// re-requests with the conversation ending on an assistant message, which
+/// Anthropic rejects ("does not support assistant message prefill").
+struct IdGen {
+    last_timestamp: i64,
+    counter: u64,
+    /// Import-time "now". Generated ids are clamped to sort at or below the id a live opencode would
+    /// mint at this instant, so an imported message can never outrank the live conversation when the
+    /// session is resumed (resume happens strictly after import). See `next`.
+    now_ceiling: i64,
+}
+
+impl IdGen {
+    const CHARS: &'static [u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    /// opencode's 12-hex id prefix encodes only the low 48 bits of `timestamp_ms * 0x1000 + counter`,
+    /// i.e. `timestamp_ms mod 2^36`, so the sortable id space WRAPS every `1 << 36` ms (~795 days).
+    /// An id built from a timestamp in an earlier window sorts ABOVE a fresh native id — which is
+    /// exactly what re-triggers the run-loop hang on opencode <= 1.18.4 (upstream `dev` avoids it by
+    /// comparing `time.created` first). We clamp every imported timestamp into the single window that
+    /// ends at `now_ceiling`, so it can never wrap back above a resume-time native id.
+    const WRAP_MS: i64 = 1 << 36;
+
+    fn new(now_ceiling: i64) -> Self {
+        Self { last_timestamp: -1, counter: 0, now_ceiling }
+    }
+
+    /// opencode's 12-hex, time-sortable prefix for an already-combined `timestamp_ms * 0x1000 + counter`.
+    fn encode_prefix(current: u128) -> String {
+        let mut s = String::with_capacity(12);
+        for i in 0..6 {
+            s.push_str(&format!("{:02x}", ((current >> (40 - 8 * i)) & 0xff) as u8));
+        }
+        s
+    }
+
+    /// `<prefix>_<12 hex time chars><14 random chars>`; monotonic for equal or
+    /// out-of-order timestamps, so ordering always follows emission order.
+    fn next(&mut self, prefix: &str, timestamp_ms: i64) -> String {
+        // Clamp into the single ~795-day wrap window ending at `now_ceiling` (import time): never
+        // above the ceiling, and never before the window's start (`now_ceiling` rounded down to a
+        // 2^36-ms boundary). Within that window `timestamp mod 2^36` is monotonic and always <= the
+        // ceiling's, so a native id opencode mints at resume (strictly later than import) outranks
+        // every id we emit. Timestamps older than the window collapse to its start but keep their
+        // emission order via the monotonic counter below. LIMITATION: a session spanning >~795 days,
+        // or a resume that itself crosses a wrap boundary, can't be fully ordered by id alone.
+        let window_start = self.now_ceiling - self.now_ceiling.rem_euclid(Self::WRAP_MS);
+        let clamped = timestamp_ms.clamp(window_start, self.now_ceiling);
+        // Never let a stale timestamp produce a smaller id than the previous one.
+        let ts = clamped.max(self.last_timestamp);
+        if ts != self.last_timestamp {
+            self.last_timestamp = ts;
+            self.counter = 0;
+        }
+        self.counter += 1;
+        // counter shares the low 12 bits with opencode's scheme; wrap into the
+        // next millisecond rather than colliding once it overflows.
+        if self.counter >= 0x1000 {
+            self.last_timestamp += 1;
+            self.counter = 1;
+        }
+        let current = (self.last_timestamp as u128) * 0x1000 + self.counter as u128;
+        let mut out = String::with_capacity(prefix.len() + 1 + 26);
+        out.push_str(prefix);
+        out.push('_');
+        out.push_str(&Self::encode_prefix(current));
+        let bytes = Uuid::new_v4();
+        for b in bytes.as_bytes().iter().take(14) {
+            out.push(Self::CHARS[(*b as usize) % 62] as char);
+        }
+        out
+    }
+
+    /// A fresh native opencode-style id (counter 0) as a live instance would mint at `timestamp_ms`.
+    /// Test-only: lets ordering assertions use a real native id instead of the wall clock, so they
+    /// stay stable across opencode's ~795-day id-wrap boundary.
+    #[cfg(test)]
+    fn native_like(prefix: &str, timestamp_ms: i64) -> String {
+        format!("{prefix}_{}{}", Self::encode_prefix((timestamp_ms as u128) * 0x1000), "0".repeat(14))
+    }
+}
+
+#[cfg(test)]
+mod idgen_tests {
+    use super::IdGen;
+
+    #[test]
+    fn ids_sort_chronologically_and_monotonically() {
+        // Ceiling above the timestamps used, so the wrap-clamp doesn't interfere with this test.
+        let mut g = IdGen::new(1_700_000_002_000);
+        let a = g.next("msg", 1_700_000_000_000);
+        let b = g.next("msg", 1_700_000_000_000); // same ms
+        let c = g.next("msg", 1_700_000_001_000); // later
+        let d = g.next("msg", 1_600_000_000_000); // EARLIER (out of order input)
+        assert!(a < b, "same-timestamp ids must increase: {a} !< {b}");
+        assert!(b < c, "later timestamp must sort higher: {b} !< {c}");
+        assert!(c < d, "a stale timestamp must not go backwards: {c} !< {d}");
+        assert_eq!(a.len(), "msg_".len() + 26);
+        assert!(a.starts_with("msg_"));
+    }
+
+    #[test]
+    fn imported_ids_never_outrank_a_native_id_minted_at_resume() {
+        // Date-INDEPENDENT: opencode's id prefix carries only `timestamp mod 2^36`, so it wraps every
+        // ~795 days; comparing against `Utc::now()` made this test fail for ~7.5 months of every
+        // 26-month cycle (a boundary was crossed 2026-08-14). Instead we fix a reference "now"
+        // mid-window and compare against a real native-style id built with the same 48-bit truncation.
+        const WRAP: i64 = 1 << 36;
+        let now = 100 * WRAP + WRAP / 2; // mid wrap-window, far from any boundary
+        let mut g = IdGen::new(now);
+        // An id from a PREVIOUS wrap window (which naively sorts ABOVE `now`) must be clamped below it.
+        let ancient = g.next("msg", now - 3 * WRAP - 5_000);
+        let recent = g.next("msg", now - 60_000); // within the current window
+        // A fresh native id a live opencode would mint at resume (>= import time), counter 0.
+        let native = IdGen::native_like("msg", now);
+        assert!(recent < native, "recent import must sort below a resume-time native id: {recent} !< {native}");
+        assert!(ancient < native, "a wrapped-old import must still sort below native: {ancient} !< {native}");
+        assert!(ancient < recent, "emission order preserved across the clamp: {ancient} !< {recent}");
     }
 }

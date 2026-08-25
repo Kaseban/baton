@@ -120,7 +120,7 @@ impl Format for GeminiCli {
                         if text.is_empty() {
                             None
                         } else if thought.unwrap_or(false) {
-                            Some(Part::Reasoning { text: text.clone() })
+                            Some(Part::Reasoning { text: text.clone(), signature: None })
                         } else {
                             Some(Part::Text { text: text.clone() })
                         }
@@ -195,7 +195,7 @@ impl Format for GeminiCli {
             for p in &msg.parts {
                 match p {
                     Part::Text { text } => parts.push(serde_json::json!({ "text": text })),
-                    Part::Reasoning { text } => {
+                    Part::Reasoning { text, .. } => {
                         parts.push(serde_json::json!({ "text": text, "thought": true }))
                     }
                     Part::ToolCall { name, input, .. } => parts.push(serde_json::json!({
@@ -343,7 +343,7 @@ mod tests {
                 Message {
                     role: Role::Assistant,
                     parts: vec![
-                        Part::Reasoning { text: "hmm".into() },
+                        Part::Reasoning { text: "hmm".into(), signature: None },
                         Part::text("hi"),
                         Part::ToolCall {
                             name: "read_file".into(),
@@ -369,7 +369,7 @@ mod tests {
         assert_eq!(back.messages[0].role, Role::User);
         assert_eq!(back.messages[0].parts[0].as_text(), Some("hello gemini"));
         let asst = &back.messages[1];
-        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text } if text == "hmm")));
+        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text, .. } if text == "hmm")));
         assert!(asst.parts.iter().any(|p| matches!(p, Part::ToolCall { name, .. } if name == "read_file")));
         assert!(asst.parts.iter().any(|p| matches!(p, Part::ToolResult { name, .. } if name == "read_file")));
     }
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(s.messages[0].parts[0].as_text(), Some("question"));
         let asst = &s.messages[1];
         assert_eq!(asst.role, Role::Assistant);
-        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text } if text == "Plan: do thing")));
+        assert!(asst.parts.iter().any(|p| matches!(p, Part::Reasoning { text, .. } if text == "Plan: do thing")));
         assert!(asst.parts.iter().any(|p| p.as_text() == Some("answer")));
     }
 }

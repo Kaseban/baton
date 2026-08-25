@@ -69,7 +69,20 @@ pub enum Part {
     /// Plain text content from user or assistant.
     Text { text: String },
     /// Reasoning / thinking trace (Claude "thinking", o1 chain-of-thought, etc.).
-    Reasoning { text: String },
+    Reasoning {
+        text: String,
+        /// Provider-issued signature over the reasoning block (Anthropic
+        /// `thinking.signature`).
+        ///
+        /// Anthropic signs every thinking block it emits and *requires* the
+        /// signature to be echoed back verbatim when that block is replayed in a
+        /// later request; a client can neither generate nor re-sign one. Dropping
+        /// it makes the converted session unusable in the target agent, which
+        /// fails with a 400 as soon as the history is replayed. Formats with no
+        /// equivalent concept simply leave this `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
     /// A tool invocation made by the assistant.
     ToolCall {
         name: String,

@@ -134,7 +134,7 @@ impl Format for Codex {
                     }
                     (
                         Role::Assistant,
-                        vec![Part::Reasoning { text: combined.join("\n") }],
+                        vec![Part::Reasoning { text: combined.join("\n"), signature: None }],
                     )
                 }
                 ResponseItem::FunctionCall { name, arguments, call_id } => {
@@ -275,7 +275,7 @@ impl Format for Codex {
                         };
                         texts.push(serde_json::json!({ "type": content_type, "text": text }));
                     }
-                    Part::Reasoning { text } => {
+                    Part::Reasoning { text, .. } => {
                         flush_message(&mut texts, role, &mut emit)?;
                         emit(serde_json::json!({
                             "type": "reasoning",
@@ -427,7 +427,7 @@ mod tests {
                 Message {
                     role: Role::Assistant,
                     parts: vec![
-                        Part::Reasoning { text: "planning".into() },
+                        Part::Reasoning { text: "planning".into(), signature: None },
                         Part::text("running it"),
                         Part::ToolCall {
                             name: "shell".into(),
@@ -453,7 +453,7 @@ mod tests {
         assert_eq!(back.messages[0].role, Role::User);
         assert_eq!(back.messages[0].parts[0].as_text(), Some("run ls for me"));
         let all_parts: Vec<&Part> = back.messages.iter().flat_map(|m| m.parts.iter()).collect();
-        assert!(all_parts.iter().any(|p| matches!(p, Part::Reasoning { text } if text == "planning")));
+        assert!(all_parts.iter().any(|p| matches!(p, Part::Reasoning { text, .. } if text == "planning")));
         assert!(all_parts.iter().any(|p| matches!(p, Part::ToolCall { name, id, input }
             if name == "shell" && id.as_deref() == Some("call_7") && input.as_ref().unwrap()["command"][0] == "ls")));
         assert!(all_parts.iter().any(|p| matches!(p, Part::ToolResult { id, output, .. }
