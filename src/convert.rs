@@ -91,6 +91,14 @@ pub fn import_to_target(to: Agent, file: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Claude encodes a project directory by replacing path separators (and dots) with dashes.
+pub fn encode_claude_project_dir(dir: &Path) -> String {
+    dir.to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '\\' || c == '.' || c == ':' { '-' } else { c })
+        .collect()
+}
+
 /// Place a converted .jsonl where Claude Code will find it:
 /// `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl`, resumable via `claude --resume <uuid>`.
 fn import_claude(file: &Path) -> anyhow::Result<()> {
@@ -122,13 +130,8 @@ fn import_claude(file: &Path) -> anyhow::Result<()> {
         }
     };
 
-    // Claude encodes the project cwd by replacing path separators (and dots) with dashes.
     let cwd = std::env::current_dir().context("getting cwd")?;
-    let encoded: String = cwd
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c == '/' || c == '\\' || c == '.' || c == ':' { '-' } else { c })
-        .collect();
+    let encoded = encode_claude_project_dir(&cwd);
     let dir = dirs::home_dir()
         .context("no home dir")?
         .join(".claude")
