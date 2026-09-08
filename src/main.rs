@@ -8,6 +8,7 @@ mod convert;
 mod detect;
 mod formats;
 mod pick;
+mod watch;
 
 #[cfg(feature = "mcp")]
 mod mcp;
@@ -71,6 +72,25 @@ enum Cmd {
     },
     /// Run as an MCP server (stdio transport). Called by agents automatically.
     Serve,
+    /// Watch this project's sessions for quota-death and pass the baton automatically.
+    Watch {
+        /// Unattended: fail over opted-in sessions without prompting
+        /// (opt in via the `failover_opt_in` MCP tool).
+        #[arg(long)]
+        auto: bool,
+        /// Scan once and exit (useful from agent hooks) instead of polling.
+        #[arg(long)]
+        once: bool,
+        /// Poll interval in seconds.
+        #[arg(long, default_value_t = 15)]
+        interval: u64,
+        /// Failover target agent (default: claude-code ⇄ opencode).
+        #[arg(long, value_parser = parse_agent)]
+        to: Option<Agent>,
+        /// Project directory to watch (default: current directory).
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -112,6 +132,19 @@ fn main() -> anyhow::Result<()> {
             #[cfg(not(feature = "mcp"))]
             anyhow::bail!("baton was built without the `mcp` feature; rebuild with --features mcp");
         }
+        Cmd::Watch {
+            auto,
+            once,
+            interval,
+            to,
+            project,
+        } => watch::run(watch::WatchOpts {
+            auto,
+            once,
+            interval,
+            to,
+            project,
+        })?,
     }
     Ok(())
 }
