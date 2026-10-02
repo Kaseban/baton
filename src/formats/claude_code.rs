@@ -17,7 +17,7 @@ use anyhow::Context;
 use chrono::DateTime;
 use serde::Deserialize;
 
-use crate::canonical::{Agent, Format, Message, Part, Role, Session, SessionRef};
+use crate::canonical::{Agent, Format, Message, ModelRef, Part, Role, Session, SessionRef};
 
 pub struct ClaudeCode;
 
@@ -44,6 +44,9 @@ impl Format for ClaudeCode {
         let mut messages = Vec::new();
         let mut first_ts: Option<i64> = None;
         let mut last_ts: i64 = 0;
+        let mut directory: Option<String> = None;
+        let mut custom_title: Option<String> = None;
+        let mut ai_title: Option<String> = None;
 
         for line in raw.lines() {
             let line = line.trim();
@@ -54,7 +57,13 @@ impl Format for ClaudeCode {
                 Ok(e) => e,
                 Err(_) => continue,
             };
+            if directory.is_none() {
+                directory = entry.cwd.clone().filter(|c| !c.is_empty());
+            }
             match entry.entry_type.as_str() {
+                // Claude Code re-appends these whenever the title changes; the last one wins.
+                "custom-title" => custom_title = entry.custom_title.or(custom_title),
+                "ai-title" => ai_title = entry.ai_title.or(ai_title),
                 "user" | "assistant" => {
                     let Some(msg) = entry.message else { continue };
                     let role = match msg.role.as_str() {
@@ -82,6 +91,16 @@ impl Format for ClaudeCode {
                         parts,
                         time_created: ts,
                         origin: Some(Agent::ClaudeCode),
+                        // `<synthetic>` marks messages Claude Code made up itself (API
+                        // errors, interruptions); no model by that name exists.
+                        model: msg
+                            .model
+                            .filter(|m| !m.is_empty() && m != "<synthetic>")
+                            .map(|id| ModelRef {
+                                provider: "anthropic".to_string(),
+                                id,
+                            }),
+                        summary: false,
                     });
                 }
                 _ => continue,
@@ -94,10 +113,16 @@ impl Format for ClaudeCode {
             title: String::new(),
             time_created: first_ts.unwrap_or(0),
             time_updated: last_ts,
-            directory: None,
+            directory,
+            title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages,
         };
-        session.title = truncate_title(session.first_user_text().unwrap_or(""));
+        session.title = match custom_title.or(ai_title) {
+            Some(title) => title,
+            None => truncate_title(session.first_user_text().unwrap_or("")),
+        };
         Ok(session)
     }
 
@@ -200,6 +225,12 @@ struct Entry {
     message: Option<ClaudeMessage>,
     #[serde(default)]
     timestamp: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(rename = "customTitle", default)]
+    custom_title: Option<String>,
+    #[serde(rename = "aiTitle", default)]
+    ai_title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +241,8 @@ struct ClaudeMessage {
     content: serde_json::Value,
     #[serde(default)]
     timestamp: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn parse_content(content: &serde_json::Value) -> (Vec<Part>, bool) {
@@ -283,7 +316,18 @@ fn parse_content(content: &serde_json::Value) -> (Vec<Part>, bool) {
                                 output,
                                 is_error,
                             });
+                            // The result's images follow it as attachments; writers that
+                            // can attach files to a tool result pick them up from there.
+                            if let Some(serde_json::Value::Array(blocks)) = block.get("content") {
+                                parts.extend(blocks.iter().filter_map(image_attachment));
+                            }
                             has_content = true;
+                        }
+                        "image" => {
+                            if let Some(image) = image_attachment(block) {
+                                parts.push(image);
+                                has_content = true;
+                            }
                         }
                         _ => {}
                     }
@@ -324,6 +368,26 @@ fn flatten_tool_result_content(blocks: &[serde_json::Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// An Anthropic `{"type":"image","source":{"type":"base64",...}}` block as an attachment.
+fn image_attachment(block: &serde_json::Value) -> Option<Part> {
+    if block.get("type").and_then(|v| v.as_str()) != Some("image") {
+        return None;
+    }
+    let source = block.get("source")?;
+    if source.get("type").and_then(|v| v.as_str()) != Some("base64") {
+        return None;
+    }
+    Some(Part::Attachment {
+        mime: source
+            .get("media_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("image/png")
+            .to_string(),
+        path: None,
+        data: Some(source.get("data")?.as_str()?.to_string()),
+    })
 }
 
 fn is_meta_user(text: &str) -> bool {
@@ -388,6 +452,14 @@ fn parts_to_claude_content(parts: &[Part]) -> serde_json::Value {
                 "content": output.clone().unwrap_or_default(),
                 "is_error": is_error.unwrap_or(false),
             }),
+            Part::Attachment {
+                mime,
+                path: _,
+                data: Some(data),
+            } if mime.starts_with("image/") => serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": mime, "data": data },
+            }),
             Part::Attachment { mime, path, data } => {
                 let mut o = serde_json::json!({"type":"attachment","mime": mime});
                 if let Some(p) = path {
@@ -434,6 +506,144 @@ mod tests {
     }
 
     #[test]
+    fn read_keeps_directory_title_and_model() {
+        let dir = std::env::temp_dir().join(format!("baton-claude-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("0b9c0000-0000-0000-0000-000000000000.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"ai-title","aiTitle":"Generated title","sessionId":"0b9c"}"#,
+            "\n",
+            r#"{"type":"user","cwd":"/work/repo/sub","message":{"role":"user","content":"a long first prompt"},"timestamp":"2024-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","cwd":"/work/repo/sub","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"hi"}]},"timestamp":"2024-01-01T00:00:01Z"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"First name","sessionId":"0b9c"}"#,
+            "\n",
+            r#"{"type":"assistant","cwd":"/elsewhere","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error"}]},"timestamp":"2024-01-01T00:00:02Z"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"Renamed","sessionId":"0b9c"}"#,
+            "\n",
+        );
+        std::fs::write(&path, jsonl).unwrap();
+        let s = ClaudeCode::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(s.directory.as_deref(), Some("/work/repo/sub"));
+        assert_eq!(
+            s.title, "Renamed",
+            "the latest user-set title beats the generated one"
+        );
+        assert_eq!(s.messages[0].model, None);
+        assert_eq!(
+            s.messages[1].model,
+            Some(ModelRef {
+                provider: "anthropic".into(),
+                id: "claude-opus-4-8".into()
+            })
+        );
+        assert_eq!(s.messages[2].model, None, "<synthetic> is not a real model");
+    }
+
+    #[test]
+    fn read_falls_back_to_generated_then_prompt_title() {
+        let dir = std::env::temp_dir().join(format!("baton-claude-title-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt = r#"{"type":"user","message":{"role":"user","content":"first prompt"},"timestamp":"2024-01-01T00:00:00Z"}"#;
+
+        let path = dir.join("with-ai-title.jsonl");
+        let ai_title = r#"{"type":"ai-title","aiTitle":"Generated title"}"#;
+        std::fs::write(&path, format!("{prompt}\n{ai_title}\n")).unwrap();
+        assert_eq!(ClaudeCode::read(&path).unwrap().title, "Generated title");
+
+        let path = dir.join("untitled.jsonl");
+        std::fs::write(&path, format!("{prompt}\n")).unwrap();
+        assert_eq!(ClaudeCode::read(&path).unwrap().title, "first prompt");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_keeps_pasted_and_tool_result_images() {
+        let dir = std::env::temp_dir().join(format!("baton-claude-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1a2b0000-0000-0000-0000-000000000000.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"UE5H"}},{"type":"text","text":"what is this?"}]},"timestamp":"2024-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/x.jpg"}}]},"timestamp":"2024-01-01T00:00:01Z"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"read it"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"SlBH"}}]}]},"timestamp":"2024-01-01T00:00:02Z"}"#,
+            "\n",
+        );
+        std::fs::write(&path, jsonl).unwrap();
+        let s = ClaudeCode::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(s.title, "what is this?");
+        assert!(
+            matches!(&s.messages[0].parts[0], Part::Attachment { mime, data, .. } if mime == "image/png" && data.as_deref() == Some("UE5H"))
+        );
+        let result = &s.messages[2].parts;
+        assert!(
+            matches!(&result[0], Part::ToolResult { output, .. } if output.as_deref().unwrap().starts_with("read it\n[image omitted: image/jpeg"))
+        );
+        assert!(
+            matches!(&result[1], Part::Attachment { mime, data, .. } if mime == "image/jpeg" && data.as_deref() == Some("SlBH"))
+        );
+    }
+
+    #[test]
+    fn write_emits_images_as_image_blocks() {
+        let dir = std::env::temp_dir().join(format!("baton-claude-img-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("22222222-2222-3333-4444-555555555555.jsonl");
+        let session = Session {
+            source_id: "22222222-2222-3333-4444-555555555555".into(),
+            origin: Agent::Opencode,
+            title: "t".into(),
+            time_created: 1000,
+            time_updated: 1000,
+            directory: None,
+            title_prefix: None,
+            parent: None,
+            children: Vec::new(),
+            messages: vec![Message {
+                role: Role::User,
+                parts: vec![
+                    Part::text("look"),
+                    Part::Attachment {
+                        mime: "image/png".into(),
+                        path: None,
+                        data: Some("UE5H".into()),
+                    },
+                ],
+                time_created: 1000,
+                origin: None,
+                model: None,
+                summary: false,
+            }],
+        };
+        ClaudeCode::write(&session, &path).unwrap();
+        let line: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let back = ClaudeCode::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            line["message"]["content"][1],
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"UE5H"}})
+        );
+        assert!(
+            matches!(&back.messages[0].parts[1], Part::Attachment { data, .. } if data.as_deref() == Some("UE5H"))
+        );
+    }
+
+    #[test]
     fn write_read_round_trip() {
         let dir = std::env::temp_dir().join(format!("baton-claude-rt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -446,12 +656,17 @@ mod tests {
             time_created: 1000,
             time_updated: 2000,
             directory: Some("/tmp".into()),
+            title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![
                 Message {
                     role: Role::User,
                     parts: vec![Part::text("question")],
                     time_created: 1000,
                     origin: None,
+                    model: None,
+                    summary: false,
                 },
                 Message {
                     role: Role::Assistant,
@@ -465,6 +680,8 @@ mod tests {
                     ],
                     time_created: 1001,
                     origin: None,
+                    model: None,
+                    summary: false,
                 },
             ],
         };

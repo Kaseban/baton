@@ -190,6 +190,8 @@ impl Format for Codex {
                 parts,
                 time_created: line_ts,
                 origin: Some(Agent::Codex),
+                model: None,
+                summary: false,
             });
         }
 
@@ -212,6 +214,9 @@ impl Format for Codex {
             time_created: first_ts.unwrap_or(0),
             time_updated: last_ts,
             directory,
+            title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages,
         })
     }
@@ -417,12 +422,17 @@ mod tests {
             time_created: 0,
             time_updated: 0,
             directory: None,
+            title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages: vec![
                 Message {
                     role: Role::User,
                     parts: vec![Part::text("run ls for me")],
                     time_created: 0,
                     origin: None,
+                    model: None,
+                    summary: false,
                 },
                 Message {
                     role: Role::Assistant,
@@ -443,6 +453,8 @@ mod tests {
                     ],
                     time_created: 1,
                     origin: None,
+                    model: None,
+                    summary: false,
                 },
             ],
         };

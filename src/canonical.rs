@@ -47,7 +47,8 @@ impl Agent {
             "codex" => Agent::Codex,
             "cursor" => Agent::Cursor,
             "continue" => Agent::Continue,
-            "cline" | "roo" | "roo-code" | "roocode" => Agent::Cline,
+            "cline" | "roo" | "roo-code" | "roocode" | "kilo" | "kilo-code" | "kilocode" | "zoo"
+            | "zoo-code" | "zoocode" => Agent::Cline,
             "zed" => Agent::Zed,
             "aider" => Agent::Aider,
             "gemini" | "gemini-cli" => Agent::GeminiCli,
@@ -139,6 +140,22 @@ pub struct Message {
     /// Origin agent that produced this message (useful when merging).
     #[serde(default)]
     pub origin: Option<Agent>,
+    /// Model that produced this message, when the source format records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRef>,
+    /// A summary the agent wrote to stand in for everything before it once the
+    /// context filled up; the agent kept sending only the summary and what
+    /// follows it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub summary: bool,
+}
+
+/// A model as a provider id plus that provider's model id, e.g. `anthropic` +
+/// `claude-opus-4-8`, which is how opencode addresses models.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRef {
+    pub provider: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,6 +184,16 @@ pub struct Session {
     /// The directory the session was working in, if known.
     #[serde(default)]
     pub directory: Option<String>,
+    /// What the target puts in front of `title` (e.g. `[import:roo] `). `None`
+    /// keeps the target's own default, which for opencode is `[<origin>] `.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_prefix: Option<String>,
+    /// Source id of the session that spawned this one as a subtask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Source ids of the subtask sessions this one spawned, in spawn order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<String>,
     pub messages: Vec<Message>,
 }
 
@@ -186,6 +213,31 @@ impl Session {
         self.messages.retain(|m| !m.parts.is_empty());
     }
 
+    /// Rewrite path prefixes recorded on another machine to where the same
+    /// files live here, e.g. `/Users/me/projects` -> `/home/me/projekty`.
+    ///
+    /// Applies to the session directory, to every string in tool-call inputs
+    /// and to attachment paths. A prefix only matches on a path-component
+    /// boundary, so `/a/b` rewrites `/a/b` and `/a/b/c` but not `/a/bc`. The
+    /// first matching mapping wins, so list more specific prefixes first.
+    pub fn map_paths(&mut self, maps: &[(String, String)]) {
+        if maps.is_empty() {
+            return;
+        }
+        if let Some(dir) = &mut self.directory {
+            map_path(dir, maps);
+        }
+        for msg in &mut self.messages {
+            for part in &mut msg.parts {
+                match part {
+                    Part::ToolCall { input: Some(input), .. } => map_json_paths(input, maps),
+                    Part::Attachment { path: Some(path), .. } => map_path(path, maps),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     pub fn first_user_text(&self) -> Option<&str> {
         self.messages
             .iter()
@@ -196,6 +248,48 @@ impl Session {
                     _ => None,
                 })
             })
+    }
+}
+
+/// Rewrite `path` in place with the first mapping whose prefix it starts with
+/// on a component boundary. Tool inputs embed paths in longer strings too
+/// (`cd /Users/me/x && make`), so a prefix also matches after whitespace, a
+/// quote or `=`.
+fn map_path(path: &mut String, maps: &[(String, String)]) {
+    let mut out = String::with_capacity(path.len());
+    let mut rest = path.as_str();
+    let mut changed = false;
+    let mut at_boundary = true;
+    'scan: while !rest.is_empty() {
+        if at_boundary {
+            for (from, to) in maps {
+                if let Some(after) = rest.strip_prefix(from.as_str())
+                    && (after.is_empty() || after.starts_with(['/', '\\']) || from.ends_with(['/', '\\']))
+                {
+                    out.push_str(to);
+                    rest = after;
+                    changed = true;
+                    at_boundary = false;
+                    continue 'scan;
+                }
+            }
+        }
+        let c = rest.chars().next().unwrap_or_default();
+        at_boundary = c.is_whitespace() || matches!(c, '"' | '\'' | '=' | '(' | '`' | ':' | ',');
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    if changed {
+        *path = out;
+    }
+}
+
+fn map_json_paths(value: &mut serde_json::Value, maps: &[(String, String)]) {
+    match value {
+        serde_json::Value::String(s) => map_path(s, maps),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| map_json_paths(v, maps)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|v| map_json_paths(v, maps)),
+        _ => {}
     }
 }
 
@@ -303,9 +397,66 @@ mod tests {
     }
 
     #[test]
+    fn map_paths_rewrites_directory_tool_inputs_and_attachments() {
+        let mut session = Session {
+            source_id: "s".into(),
+            origin: Agent::Cline,
+            title: "t".into(),
+            time_created: 0,
+            time_updated: 0,
+            directory: Some("/Users/me/projects/app".into()),
+            title_prefix: None,
+            parent: None,
+            children: Vec::new(),
+            messages: vec![Message {
+                role: Role::Assistant,
+                parts: vec![
+                    Part::ToolCall {
+                        name: "execute_command".into(),
+                        id: None,
+                        input: Some(serde_json::json!({
+                            "command": "cd /Users/me/projects/app && cat '/Users/me/projects/app/a'",
+                            "files": [{ "path": "/Users/me/projectsX/b" }, { "path": "/Users/me/projects" }],
+                        })),
+                    },
+                    Part::Attachment {
+                        mime: "image/png".into(),
+                        path: Some("/Volumes/x/shot.png".into()),
+                        data: None,
+                    },
+                ],
+                time_created: 0,
+                origin: None,
+                model: None,
+                summary: false,
+            }],
+        };
+        session.map_paths(&[
+            ("/Users/me/projects".into(), "/home/me/projekty".into()),
+            ("/Volumes/x".into(), "/mnt/x".into()),
+        ]);
+        assert_eq!(session.directory.as_deref(), Some("/home/me/projekty/app"));
+        let Part::ToolCall { input: Some(input), .. } = &session.messages[0].parts[0] else {
+            panic!("tool call");
+        };
+        assert_eq!(
+            input["command"],
+            "cd /home/me/projekty/app && cat '/home/me/projekty/app/a'"
+        );
+        assert_eq!(input["files"][0]["path"], "/Users/me/projectsX/b", "only on a path boundary");
+        assert_eq!(input["files"][1]["path"], "/home/me/projekty");
+        let Part::Attachment { path, .. } = &session.messages[0].parts[1] else {
+            panic!("attachment");
+        };
+        assert_eq!(path.as_deref(), Some("/mnt/x/shot.png"));
+    }
+
+    #[test]
     fn agent_parse_aliases() {
         assert_eq!(Agent::parse("Claude Code"), Some(Agent::ClaudeCode));
         assert_eq!(Agent::parse("roo"), Some(Agent::Cline));
+        assert_eq!(Agent::parse("kilo"), Some(Agent::Cline));
+        assert_eq!(Agent::parse("zoo"), Some(Agent::Cline));
         assert_eq!(Agent::parse("gemini"), Some(Agent::GeminiCli));
         assert_eq!(Agent::parse("nope"), None);
     }

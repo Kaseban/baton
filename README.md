@@ -82,11 +82,13 @@ You never have to hunt these down (`--latest` and the interactive picker find th
 | Aider | ✅ | ✅ | — |
 | Cursor | ✅¹ | —² | — |
 | Continue | ✅ | — | — |
-| Cline / Roo | ✅ | —² | — |
+| Cline / Roo Code / Kilo Code / Zoo Code | ✅³ | —² | — |
 
 ¹ Cursor reads from exported JSON (`sqlite3 state.vscdb "SELECT value FROM ItemTable WHERE key='aiService:chats'"`)
 
 ² Not planned: Cursor and Cline keep session state inside editor databases (SQLite / VS Code globalState) with no file-level import path.
+
+³ Pass the task directory (`<globalStorage>/<extension-id>/tasks/<task-id>/`) or the `api_conversation_history.json` in it. Workspace, title, timestamps, models, images, subtasks (as opencode child sessions) and condensed-context summaries (as opencode compactions) come along; tools map to opencode's native ones where one exists.
 
 ## Benchmark
 
