@@ -61,6 +61,7 @@ impl Format for ContinueDev {
                 parts,
                 time_created: ts,
                 origin: Some(Agent::Continue),
+                model: None,
             });
             ts += 1;
         }
@@ -88,6 +89,7 @@ impl Format for ContinueDev {
             time_created: now,
             time_updated: now,
             directory: None,
+            title_prefix: None,
             messages,
         })
     }
