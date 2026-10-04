@@ -7,17 +7,32 @@ use anyhow::Context;
 use crate::canonical::{Agent, Session};
 use crate::formats;
 
+/// Adjustments applied to the session between reading and writing it.
+#[derive(Debug, Default)]
+pub struct Options {
+    /// Lossy: strip all tool calls and tool outputs.
+    pub compress: bool,
+    /// `(from, to)` path prefixes, see [`Session::map_paths`].
+    pub path_maps: Vec<(String, String)>,
+    /// Replaces the target's default title prefix.
+    pub title_prefix: Option<String>,
+}
+
 /// Returns the path the converted session was written to.
 pub fn convert(
     from: Agent,
     to: Agent,
     input: &Path,
     output: Option<&Path>,
-    compress: bool,
+    options: &Options,
 ) -> anyhow::Result<std::path::PathBuf> {
     let mut session = formats::read(from, input)
         .with_context(|| format!("reading {} session", from))?;
-    if compress {
+    session.map_paths(&options.path_maps);
+    if options.title_prefix.is_some() {
+        session.title_prefix.clone_from(&options.title_prefix);
+    }
+    if options.compress {
         let before = session.message_count();
         session.compress();
         eprintln!(
@@ -58,11 +73,22 @@ pub fn import_to_target(to: Agent, file: &Path) -> anyhow::Result<()> {
     match to {
         Agent::Opencode => {
             use std::io::Write;
-            let out = std::process::Command::new("opencode")
-                .arg("import")
-                .arg(file)
-                .output()
-                .context("running `opencode import`")?;
+            // opencode binds an imported session to the project of the directory
+            // `opencode import` runs in, not the one recorded in the file, so run it
+            // from the session's own directory.
+            let mut cmd = std::process::Command::new("opencode");
+            cmd.arg("import").arg(std::path::absolute(file)?);
+            match opencode_session_directory(file) {
+                Some(dir) if dir.is_dir() => {
+                    cmd.current_dir(dir);
+                }
+                Some(dir) => eprintln!(
+                    "warning: session directory {} does not exist here; importing into the current directory's project",
+                    dir.display()
+                ),
+                None => {}
+            }
+            let out = cmd.output().context("running `opencode import`")?;
             std::io::stdout().write_all(&out.stdout).ok();
             std::io::stderr().write_all(&out.stderr).ok();
             if !out.status.success() {
@@ -89,6 +115,16 @@ pub fn import_to_target(to: Agent, file: &Path) -> anyhow::Result<()> {
         Agent::Codex => import_codex(file),
         other => anyhow::bail!("no auto-import path for {other} yet"),
     }
+}
+
+pub fn opencode_session_directory(file: &Path) -> Option<std::path::PathBuf> {
+    let raw = std::fs::read_to_string(file).ok()?;
+    let export: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    export
+        .pointer("/info/directory")
+        .and_then(|d| d.as_str())
+        .filter(|d| !d.is_empty() && *d != ".")
+        .map(std::path::PathBuf::from)
 }
 
 /// Place a converted .jsonl where Claude Code will find it:

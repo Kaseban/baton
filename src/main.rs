@@ -51,6 +51,15 @@ enum Cmd {
         /// Lossy: strip all tool calls and tool outputs to shrink the converted session.
         #[arg(long)]
         compress: bool,
+        /// Rewrite a path prefix recorded on another machine, as FROM=TO
+        /// (e.g. /Users/me/projects=/home/me/projekty). Applies to the session
+        /// directory and to paths in tool inputs. Repeatable; first match wins.
+        #[arg(long = "path-map", value_name = "FROM=TO", value_parser = parse_path_map)]
+        path_maps: Vec<(String, String)>,
+        /// Title prefix replacing the target's default (`[<agent>] ` for opencode),
+        /// e.g. "[import:roo] ". Pass "" for none.
+        #[arg(long, value_name = "PREFIX")]
+        title_prefix: Option<String>,
     },
     /// List sessions from one or all agents.
     List {
@@ -64,6 +73,16 @@ enum Cmd {
     Doctor,
     /// Remove baton from every agent's config.
     Uninstall,
+    /// Print what a session records about itself as JSON, without converting
+    /// it. For Codex: originator, source, subagent parent, fork base and the
+    /// thread's rollout files, read from its `session_meta` alone.
+    Info {
+        /// Source agent.
+        #[arg(long, value_parser = parse_agent)]
+        from: Agent,
+        /// Path to the session file or directory.
+        path: PathBuf,
+    },
     /// Sniff a session file/dir and report which agent produced it.
     Detect {
         /// Path to the session file or directory.
@@ -89,20 +108,52 @@ fn main() -> anyhow::Result<()> {
             import,
             latest,
             compress,
+            path_maps,
+            title_prefix,
         } => {
             let input = match input {
                 Some(p) => p,
                 None => pick::resolve_input(from, latest)?,
             };
-            let out = convert::convert(from, to, &input, output.as_deref(), compress)?;
+            let options = convert::Options {
+                compress,
+                path_maps,
+                title_prefix,
+            };
+            let out = convert::convert(from, to, &input, output.as_deref(), &options)?;
             if import {
                 convert::import_to_target(to, &out)?;
+            } else if to == Agent::Opencode
+                && let Some(dir) = convert::opencode_session_directory(&out)
+            {
+                eprintln!(
+                    "import it from its project so opencode files it there: cd {} && opencode import {}",
+                    dir.display(),
+                    std::path::absolute(&out)?.display()
+                );
             }
         }
         Cmd::List { agent } => list(agent)?,
         Cmd::Install => install()?,
         Cmd::Doctor => doctor()?,
         Cmd::Uninstall => uninstall()?,
+        Cmd::Info { from, path } => {
+            let info = match from {
+                Agent::Codex => formats::codex::info(&path)?,
+                _ => {
+                    let session = formats::read(from, &path)?;
+                    serde_json::json!({
+                        "id": session.source_id,
+                        "title": session.title,
+                        "directory": session.directory,
+                        "parent": session.parent,
+                        "children": session.children,
+                        "messages": session.messages.len(),
+                    })
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&info)?);
+        }
         Cmd::Detect { path } => {
             println!("{}", detect::detect_at_path(&path));
         }
@@ -118,6 +169,15 @@ fn main() -> anyhow::Result<()> {
 
 fn parse_agent(s: &str) -> Result<Agent, String> {
     Agent::parse(s).ok_or_else(|| format!("unknown agent '{s}'"))
+}
+
+fn parse_path_map(s: &str) -> Result<(String, String), String> {
+    match s.split_once('=') {
+        Some((from, to)) if !from.is_empty() && !to.is_empty() => {
+            Ok((from.to_string(), to.to_string()))
+        }
+        _ => Err(format!("expected FROM=TO, got '{s}'")),
+    }
 }
 
 fn list(agent: Option<Agent>) -> anyhow::Result<()> {

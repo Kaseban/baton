@@ -66,7 +66,7 @@ You never have to hunt these down (`--latest` and the interactive picker find th
 | Agent | Location |
 |---|---|
 | Claude Code | `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl` |
-| Codex CLI | `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl` |
+| Codex CLI / Desktop | `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl` (archived: `~/.codex/archived_sessions/`) |
 
 `baton list` prints the path of every session it can find, across all agents.
 
@@ -76,17 +76,21 @@ You never have to hunt these down (`--latest` and the interactive picker find th
 |---|:---:|:---:|:---:|
 | Claude Code | ✅ | ✅ | — |
 | OpenCode | ✅ | ✅ | ✅ `opencode import` |
-| Codex CLI | ✅ | ✅ | — |
+| Codex CLI / Codex Desktop | ✅⁴ | ✅ | — |
 | Gemini CLI | ✅ | ✅ | — |
 | Zed | ✅ | ✅ | — |
 | Aider | ✅ | ✅ | — |
 | Cursor | ✅¹ | —² | — |
 | Continue | ✅ | — | — |
-| Cline / Roo | ✅ | —² | — |
+| Cline / Roo Code / Kilo Code / Zoo Code | ✅³ | —² | — |
 
 ¹ Cursor reads from exported JSON (`sqlite3 state.vscdb "SELECT value FROM ItemTable WHERE key='aiService:chats'"`)
 
 ² Not planned: Cursor and Cline keep session state inside editor databases (SQLite / VS Code globalState) with no file-level import path.
+
+³ Pass the task directory (`<globalStorage>/<extension-id>/tasks/<task-id>/`) or the `api_conversation_history.json` in it. Workspace, title, timestamps, models, images, subtasks (as opencode child sessions) and condensed-context summaries (as opencode compactions) come along; tools map to opencode's native ones where one exists.
+
+⁴ Pass any rollout of the thread; its continuation windows (`rollout-<ts>-<thread>_<window>.jsonl`) are read with it. The project directory, the thread's name from `session_index.jsonl`, each turn's model, timestamps, images and reasoning summaries come along. Commands become opencode bash calls with their output and exit code, file changes become apply_patch calls carrying every file's content or diff, plans become todos, and MCP calls and web searches keep their own views; Codex Desktop's code-mode scripts give way to the calls they made. A subagent becomes an opencode child session linked to the one that spawned it, without the copy of its parent's history it starts with; a fork keeps the history it was forked from. Codex's compactions become opencode compactions. Codex encrypts its compaction summaries and the messages its agents send each other, so those read `[encrypted by Codex]`. `baton info --from codex <rollout>` prints the thread's originator, source, parent and files as JSON without converting it.
 
 ## Benchmark
 

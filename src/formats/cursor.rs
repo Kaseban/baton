@@ -94,6 +94,8 @@ impl Format for Cursor {
                 parts: vec![Part::Text { text }],
                 time_created: ts,
                 origin: Some(Agent::Cursor),
+                model: None,
+                summary: false,
             });
             ts += 1;
         }
@@ -123,6 +125,9 @@ impl Format for Cursor {
             time_created: now,
             time_updated: now,
             directory: None,
+            title_prefix: None,
+            parent: None,
+            children: Vec::new(),
             messages,
         })
     }
