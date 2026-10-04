@@ -328,6 +328,17 @@ impl Format for Opencode {
                                 }
                                 tool
                             }
+                            Agent::Codex => {
+                                let mut tool = codex_tool(name, input, session.directory.as_deref());
+                                if tool.name == "task"
+                                    && let Some(child) = spawned.next().filter(|c| !c.is_empty())
+                                {
+                                    tool.metadata["sessionId"] = serde_json::json!(
+                                        IdGen::session_id(&format!("{}:{child}", session.origin))
+                                    );
+                                }
+                                tool
+                            }
                             _ => NativeTool {
                                 name: name.clone(),
                                 title: name.clone(),
@@ -377,7 +388,14 @@ impl Format for Opencode {
                                     // opencode's bash view renders the command's output from
                                     // its metadata, not from `state.output`.
                                     if tool == "bash" {
-                                        state["metadata"]["output"] = serde_json::json!(out_text);
+                                        let (exit, shown) = match session.origin {
+                                            Agent::Codex => codex_exit(&out_text),
+                                            _ => (None, out_text.as_str()),
+                                        };
+                                        state["metadata"]["output"] = serde_json::json!(shown);
+                                        if let Some(exit) = exit {
+                                            state["metadata"]["exit"] = serde_json::json!(exit);
+                                        }
                                     }
                                     // ...and its question view the answers.
                                     if tool == "question" {
@@ -748,6 +766,165 @@ fn cline_tool(name: &str, input: serde_json::Value, directory: Option<&str>) -> 
         metadata: serde_json::json!({}),
         input,
     })
+}
+
+/// Map a Codex tool call onto the opencode tool that does the same job, so
+/// opencode renders it with that tool's view: commands -> bash, patches ->
+/// apply_patch with per-file diffs, plans -> todowrite, subagents -> task,
+/// MCP calls -> opencode's MCP tool names. Anything else keeps its name and
+/// input.
+fn codex_tool(name: &str, input: serde_json::Value, directory: Option<&str>) -> NativeTool {
+    let field = |key: &str| input.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let native = |native: &str, title: Option<String>, input, metadata| NativeTool {
+        name: native.to_string(),
+        title: title.unwrap_or_else(|| native.to_string()),
+        input,
+        metadata,
+    };
+    let tool = match name {
+        "exec_command" => field("command").map(|command| native("bash", Some(command), input.clone(), serde_json::json!({}))),
+        "apply_patch" => field("patchText").map(|patch| {
+            let files = patch_files(&patch, directory);
+            let title = files
+                .iter()
+                .filter_map(|f| f["relativePath"].as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let diff: String = files.iter().filter_map(|f| f["patch"].as_str()).collect();
+            let metadata = serde_json::json!({ "diff": diff, "files": files });
+            native("apply_patch", Some(title), serde_json::json!({ "patchText": patch }), metadata)
+        }),
+        "update_plan" => input.get("plan").and_then(|p| p.as_array()).map(|plan| {
+            let todos: Vec<serde_json::Value> = plan
+                .iter()
+                .map(|step| {
+                    serde_json::json!({
+                        "content": step["step"].as_str().unwrap_or_default(),
+                        "status": step["status"].as_str().unwrap_or("pending"),
+                        "priority": "medium",
+                    })
+                })
+                .collect();
+            let open = todos.iter().filter(|t| t["status"] != "completed").count();
+            native(
+                "todowrite",
+                Some(format!("{open} todos")),
+                serde_json::json!({ "todos": todos }),
+                serde_json::json!({ "todos": todos }),
+            )
+        }),
+        "view_image" => field("path").map(|path| {
+            let file = resolve_path(&path, directory);
+            native("read", Some(file.clone()), serde_json::json!({ "filePath": file }), serde_json::json!({}))
+        }),
+        "web_search" => field("query").map(|query| {
+            native("websearch", Some(query.clone()), serde_json::json!({ "query": query }), serde_json::json!({}))
+        }),
+        "spawn_agent" => field("message").map(|prompt| {
+            let description = field("task_name")
+                .or_else(|| prompt.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string))
+                .unwrap_or_else(|| "subagent".to_string())
+                .chars()
+                .take(60)
+                .collect::<String>();
+            let task = serde_json::json!({
+                "description": description,
+                "prompt": prompt,
+                "subagent_type": field("agent_type").unwrap_or_else(|| "general".to_string()),
+            });
+            native("task", Some(description), task, serde_json::json!({}))
+        }),
+        _ => name.strip_prefix("mcp__").and_then(|rest| {
+            let (server, tool) = rest.split_once("__")?;
+            Some(native(&mcp_tool_name(server, tool), None, input.clone(), serde_json::json!({})))
+        }),
+    };
+    tool.unwrap_or_else(|| NativeTool {
+        name: name.to_string(),
+        title: name.to_string(),
+        metadata: serde_json::json!({}),
+        input,
+    })
+}
+
+/// The exit code in a Codex command result (`Process exited with code N`,
+/// in the header before `Output:`), and the command's output after it.
+fn codex_exit(text: &str) -> (Option<i64>, &str) {
+    let (header, body) = match text.strip_prefix("Output:\n") {
+        Some(body) => ("", body),
+        None => match text.find("\nOutput:\n") {
+            Some(at) if at < 1024 => (&text[..at], &text[at + "\nOutput:\n".len()..]),
+            _ => return (None, text),
+        },
+    };
+    let exit = header
+        .lines()
+        .find_map(|l| l.strip_prefix("Process exited with code "))
+        .and_then(|n| n.trim().parse().ok());
+    match exit {
+        Some(_) => (exit, body),
+        None => (None, text),
+    }
+}
+
+/// opencode's per-file apply_patch metadata (what its patch view renders) for
+/// a patch in Codex's format: `*** Add File:` with `+` lines, `*** Update
+/// File:` (and `*** Move to:`) with `@@` hunks, `*** Delete File:`.
+fn patch_files(patch: &str, directory: Option<&str>) -> Vec<serde_json::Value> {
+    struct File {
+        kind: &'static str,
+        path: String,
+        move_to: Option<String>,
+        body: Vec<String>,
+    }
+    let mut files: Vec<File> = Vec::new();
+    for line in patch.lines() {
+        let header = [("*** Add File: ", "add"), ("*** Update File: ", "update"), ("*** Delete File: ", "delete")]
+            .iter()
+            .find_map(|(prefix, kind)| line.strip_prefix(prefix).map(|p| (*kind, p.trim().to_string())));
+        if let Some((kind, path)) = header {
+            files.push(File { kind, path, move_to: None, body: Vec::new() });
+        } else if let Some(to) = line.strip_prefix("*** Move to: ") {
+            if let Some(file) = files.last_mut() {
+                file.move_to = Some(to.trim().to_string());
+            }
+        } else if line.starts_with("*** ") {
+        } else if let Some(file) = files.last_mut() {
+            file.body.push(line.to_string());
+        }
+    }
+    files
+        .into_iter()
+        .map(|f| {
+            let file_path = resolve_path(&f.path, directory);
+            let shown = f.move_to.as_deref().map_or(file_path.clone(), |to| resolve_path(to, directory));
+            let mut body = f.body;
+            if f.kind == "add" {
+                body.insert(0, format!("@@ -0,0 +1,{} @@", body.len()));
+            }
+            let additions = body.iter().filter(|l| l.starts_with('+')).count();
+            let deletions = body.iter().filter(|l| l.starts_with('-')).count();
+            let mut patch = format!(
+                "Index: {shown}\n===================================================================\n--- {file_path}\n+++ {shown}\n"
+            );
+            for line in &body {
+                patch.push_str(line);
+                patch.push('\n');
+            }
+            let mut file = serde_json::json!({
+                "filePath": file_path,
+                "relativePath": relative_to(&shown, directory),
+                "type": if f.move_to.is_some() { "move" } else { f.kind },
+                "patch": patch,
+                "additions": additions,
+                "deletions": deletions,
+            });
+            if f.move_to.is_some() {
+                file["movePath"] = serde_json::json!(shown);
+            }
+            file
+        })
+        .collect()
 }
 
 /// opencode's name for tool `tool` of MCP server `server`

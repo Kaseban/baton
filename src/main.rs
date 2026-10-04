@@ -73,6 +73,16 @@ enum Cmd {
     Doctor,
     /// Remove baton from every agent's config.
     Uninstall,
+    /// Print what a session records about itself as JSON, without converting
+    /// it. For Codex: originator, source, subagent parent, fork base and the
+    /// thread's rollout files, read from its `session_meta` alone.
+    Info {
+        /// Source agent.
+        #[arg(long, value_parser = parse_agent)]
+        from: Agent,
+        /// Path to the session file or directory.
+        path: PathBuf,
+    },
     /// Sniff a session file/dir and report which agent produced it.
     Detect {
         /// Path to the session file or directory.
@@ -127,6 +137,23 @@ fn main() -> anyhow::Result<()> {
         Cmd::Install => install()?,
         Cmd::Doctor => doctor()?,
         Cmd::Uninstall => uninstall()?,
+        Cmd::Info { from, path } => {
+            let info = match from {
+                Agent::Codex => formats::codex::info(&path)?,
+                _ => {
+                    let session = formats::read(from, &path)?;
+                    serde_json::json!({
+                        "id": session.source_id,
+                        "title": session.title,
+                        "directory": session.directory,
+                        "parent": session.parent,
+                        "children": session.children,
+                        "messages": session.messages.len(),
+                    })
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&info)?);
+        }
         Cmd::Detect { path } => {
             println!("{}", detect::detect_at_path(&path));
         }
