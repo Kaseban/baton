@@ -255,19 +255,31 @@ impl Format for Opencode {
                         let call_id = id
                             .clone()
                             .unwrap_or_else(|| format!("call_{}", &Uuid::new_v4().simple().to_string()[..16]));
+                        let input = input
+                            .clone()
+                            .unwrap_or(serde_json::Value::Object(Default::default()));
+                        let tool = match msg.origin.unwrap_or(session.origin) {
+                            Agent::ClaudeCode => native_tool(name, input),
+                            _ => NativeTool {
+                                name: name.clone(),
+                                title: name.clone(),
+                                metadata: serde_json::json!({}),
+                                input,
+                            },
+                        };
                         parts_json.push(serde_json::json!({
                             "type": "tool",
                             "callID": call_id,
-                            "tool": name,
+                            "tool": tool.name,
                             "id": part_id,
                             "sessionID": session_id,
                             "messageID": msg_id,
                             "state": {
                                 "status": "completed",
-                                "input": input.clone().unwrap_or(serde_json::Value::Object(Default::default())),
+                                "input": tool.input,
                                 "output": "",
-                                "title": name,
-                                "metadata": {},
+                                "title": relative_to(&tool.title, session.directory.as_deref()),
+                                "metadata": tool.metadata,
                                 "time": { "start": ts, "end": ts + 1 },
                             },
                         }));
@@ -288,8 +300,15 @@ impl Format for Opencode {
                                         .and_then(|m: &mut serde_json::Value| m.get_mut("parts"))
                                         .and_then(|ps| ps.get_mut(pi))
                                 };
-                                if let Some(state) = target.and_then(|t| t.get_mut("state")) {
+                                if let Some(part) = target {
+                                    let is_bash = part["tool"] == "bash";
+                                    let state = &mut part["state"];
                                     state["output"] = serde_json::json!(out_text);
+                                    // opencode's bash view renders the command's output from
+                                    // its metadata, not from `state.output`.
+                                    if is_bash {
+                                        state["metadata"]["output"] = serde_json::json!(out_text);
+                                    }
                                     if errored {
                                         state["status"] = serde_json::json!("error");
                                         state["error"] = serde_json::json!(out_text);
@@ -360,6 +379,100 @@ impl Format for Opencode {
             .with_context(|| format!("writing {}", out_path.display()))?;
         Ok(())
     }
+}
+
+/// A tool call as opencode's own tool would have recorded it.
+struct NativeTool {
+    name: String,
+    input: serde_json::Value,
+    title: String,
+    metadata: serde_json::Value,
+}
+
+/// Map a Claude Code tool call onto the opencode tool that does the same job, so
+/// opencode renders it with that tool's view instead of as an unknown tool. The
+/// input keys are renamed to opencode's (`file_path` -> `filePath`, ...); keys
+/// with no opencode counterpart are kept as they are. Tools opencode has no
+/// equivalent for keep their Claude Code name.
+fn native_tool(name: &str, input: serde_json::Value) -> NativeTool {
+    let (native, renames): (&str, &[(&str, &str)]) = match name {
+        "Bash" => ("bash", &[]),
+        "Read" => ("read", &[("file_path", "filePath")]),
+        "Write" => ("write", &[("file_path", "filePath")]),
+        "Edit" => (
+            "edit",
+            &[
+                ("file_path", "filePath"),
+                ("old_string", "oldString"),
+                ("new_string", "newString"),
+                ("replace_all", "replaceAll"),
+            ],
+        ),
+        "Glob" => ("glob", &[]),
+        "Grep" => ("grep", &[("glob", "include")]),
+        "WebFetch" => ("webfetch", &[]),
+        "WebSearch" => ("websearch", &[]),
+        "TodoWrite" => ("todowrite", &[]),
+        _ => {
+            return NativeTool {
+                name: name.to_string(),
+                title: name.to_string(),
+                metadata: serde_json::json!({}),
+                input,
+            };
+        }
+    };
+    let input = match input {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let key = renames
+                        .iter()
+                        .find(|(from, _)| *from == key)
+                        .map_or(key, |(_, to)| to.to_string());
+                    (key, value)
+                })
+                .collect(),
+        ),
+        other => other,
+    };
+    let field = |key: &str| input.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    let title = match native {
+        "bash" => field("description").or_else(|| field("command")),
+        "read" | "write" | "edit" => field("filePath"),
+        "glob" | "grep" => field("pattern"),
+        "webfetch" => field("url"),
+        "websearch" => field("query"),
+        "todowrite" => input.get("todos").and_then(|t| t.as_array()).map(|todos| {
+            let open = todos.iter().filter(|t| t["status"] != "completed").count();
+            format!("{open} todos")
+        }),
+        _ => None,
+    }
+    .unwrap_or_else(|| native.to_string());
+    // opencode's todo view lists the todos from the tool's metadata.
+    let metadata = match native {
+        "todowrite" => {
+            serde_json::json!({ "todos": input.get("todos").cloned().unwrap_or_default() })
+        }
+        _ => serde_json::json!({}),
+    };
+    NativeTool {
+        name: native.to_string(),
+        input,
+        title,
+        metadata,
+    }
+}
+
+/// `path` relative to the session directory when it lies inside it, as opencode
+/// titles its own file tools; anything else unchanged.
+fn relative_to(path: &str, directory: Option<&str>) -> String {
+    directory
+        .and_then(|dir| Path::new(path).strip_prefix(dir).ok())
+        .map(|rel| rel.to_string_lossy().into_owned())
+        .filter(|rel| !rel.is_empty())
+        .unwrap_or_else(|| path.to_string())
 }
 
 /// Rough token estimate for a message's parts (~4 chars per token).
@@ -671,7 +784,10 @@ mod tests {
             _ => None,
         });
         let (name, id, input) = call.expect("tool call survives round trip");
-        assert_eq!(name, "Bash");
+        assert_eq!(
+            name, "bash",
+            "a Claude Code tool comes back as its opencode equivalent"
+        );
         assert_eq!(id.as_deref(), Some("call_1"));
         assert_eq!(input.unwrap()["command"], "ls");
         let result = asst.parts.iter().find_map(|p| match p {
@@ -867,6 +983,152 @@ mod tests {
         let path = &export["messages"][1]["info"]["path"];
         assert_eq!(path["cwd"], sub.to_str().unwrap());
         assert_eq!(path["root"], toplevel.as_str());
+    }
+
+    #[test]
+    fn write_maps_claude_code_tools_to_opencode_tools() {
+        let call = |name: &str, id: &str, input: serde_json::Value| Part::ToolCall {
+            name: name.into(),
+            id: Some(id.into()),
+            input: Some(input),
+        };
+        let result = |id: &str, output: &str| Part::ToolResult {
+            name: "tool".into(),
+            id: Some(id.into()),
+            output: Some(output.into()),
+            is_error: Some(false),
+        };
+        let message = |role, parts| Message {
+            role,
+            parts,
+            time_created: 1000,
+            origin: Some(Agent::ClaudeCode),
+            model: None,
+        };
+        let edit = serde_json::json!({
+            "file_path": "/repo/src/a.rs",
+            "old_string": "a",
+            "new_string": "b",
+            "replace_all": true,
+        });
+        let todos = serde_json::json!({ "todos": [
+            { "content": "one", "status": "completed", "activeForm": "Doing one" },
+            { "content": "two", "status": "pending", "activeForm": "Doing two" },
+        ]});
+        let session = Session {
+            source_id: "orig".into(),
+            origin: Agent::ClaudeCode,
+            title: "tools".into(),
+            time_created: 1000,
+            time_updated: 1000,
+            directory: Some("/repo".into()),
+            messages: vec![
+                message(
+                    Role::Assistant,
+                    vec![
+                        call(
+                            "Bash",
+                            "c1",
+                            serde_json::json!({ "command": "ls", "description": "List files" }),
+                        ),
+                        call("Edit", "c2", edit),
+                        call(
+                            "Grep",
+                            "c3",
+                            serde_json::json!({ "pattern": "fn", "glob": "*.rs", "-n": true }),
+                        ),
+                        call("TodoWrite", "c4", todos.clone()),
+                        call("SendUserFile", "c5", serde_json::json!({ "files": [] })),
+                    ],
+                ),
+                message(
+                    Role::User,
+                    vec![result("c1", "a.rs"), result("c2", "edited")],
+                ),
+            ],
+        };
+
+        let dir = std::env::temp_dir().join(format!("baton-test-tools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tools.json");
+        Opencode::write(&session, &path).unwrap();
+        let export: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let parts = &export["messages"][0]["parts"];
+        assert_eq!(parts[0]["tool"], "bash");
+        assert_eq!(parts[0]["state"]["title"], "List files");
+        assert_eq!(
+            parts[0]["state"]["metadata"]["output"], "a.rs",
+            "bash output is rendered from metadata"
+        );
+
+        assert_eq!(parts[1]["tool"], "edit");
+        assert_eq!(
+            parts[1]["state"]["input"],
+            serde_json::json!({ "filePath": "/repo/src/a.rs", "oldString": "a", "newString": "b", "replaceAll": true })
+        );
+        assert_eq!(parts[1]["state"]["title"], "src/a.rs");
+        assert_eq!(parts[1]["state"]["output"], "edited");
+        assert!(parts[1]["state"]["metadata"].get("output").is_none());
+
+        assert_eq!(parts[2]["tool"], "grep");
+        assert_eq!(
+            parts[2]["state"]["input"],
+            serde_json::json!({ "pattern": "fn", "include": "*.rs", "-n": true })
+        );
+
+        assert_eq!(parts[3]["tool"], "todowrite");
+        assert_eq!(parts[3]["state"]["title"], "1 todos");
+        assert_eq!(parts[3]["state"]["metadata"]["todos"], todos["todos"]);
+
+        assert_eq!(
+            parts[4]["tool"], "SendUserFile",
+            "no opencode equivalent: left as is"
+        );
+        assert_eq!(
+            parts[4]["state"]["input"],
+            serde_json::json!({ "files": [] })
+        );
+    }
+
+    #[test]
+    fn write_keeps_tool_names_from_other_agents() {
+        let session = Session {
+            source_id: "orig".into(),
+            origin: Agent::Codex,
+            title: "codex".into(),
+            time_created: 1000,
+            time_updated: 1000,
+            directory: None,
+            messages: vec![Message {
+                role: Role::Assistant,
+                parts: vec![Part::ToolCall {
+                    name: "Read".into(),
+                    id: Some("c1".into()),
+                    input: Some(serde_json::json!({ "file_path": "/x" })),
+                }],
+                time_created: 1000,
+                origin: None,
+                model: None,
+            }],
+        };
+        let dir =
+            std::env::temp_dir().join(format!("baton-test-codex-tools-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tools.json");
+        Opencode::write(&session, &path).unwrap();
+        let export: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let part = &export["messages"][0]["parts"][0];
+        assert_eq!(part["tool"], "Read");
+        assert_eq!(
+            part["state"]["input"],
+            serde_json::json!({ "file_path": "/x" })
+        );
     }
 
     #[test]
