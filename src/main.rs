@@ -97,6 +97,14 @@ fn main() -> anyhow::Result<()> {
             let out = convert::convert(from, to, &input, output.as_deref(), compress)?;
             if import {
                 convert::import_to_target(to, &out)?;
+            } else if to == Agent::Opencode
+                && let Some(dir) = convert::opencode_session_directory(&out)
+            {
+                eprintln!(
+                    "import it from its project so opencode files it there: cd {} && opencode import {}",
+                    dir.display(),
+                    std::path::absolute(&out)?.display()
+                );
             }
         }
         Cmd::List { agent } => list(agent)?,

@@ -95,6 +95,7 @@ impl Format for Cline {
                 parts,
                 time_created: ts,
                 origin: Some(Agent::Cline),
+                model: None,
             });
             ts += 1;
         }
