@@ -77,6 +77,7 @@ impl Format for Aider {
                     }],
                     time_created: ts,
                     origin: Some(Agent::Aider),
+                    model: None,
                 });
                 ts += 1;
             }

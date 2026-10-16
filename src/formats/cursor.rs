@@ -94,6 +94,7 @@ impl Format for Cursor {
                 parts: vec![Part::Text { text }],
                 time_created: ts,
                 origin: Some(Agent::Cursor),
+                model: None,
             });
             ts += 1;
         }

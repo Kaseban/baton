@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use uuid::Uuid;
 
-use crate::canonical::{Agent, Format, Message, Part, Role, Session};
+use crate::canonical::{Agent, Format, Message, ModelRef, Part, Role, Session};
 
 pub struct Opencode;
 
@@ -108,6 +108,7 @@ impl Format for Opencode {
                 parts,
                 time_created: ts,
                 origin: Some(Agent::Opencode),
+                model: msg.info.model_ref(),
             });
         }
 
@@ -123,13 +124,23 @@ impl Format for Opencode {
     }
 
     fn write(session: &Session, out_path: &Path) -> anyhow::Result<()> {
-        let default_dir = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| ".".to_string());
-        let project_id = compute_project_id(
-            session.directory.as_deref().unwrap_or(&default_dir),
-        );
+        let directory = session.directory.clone().unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| ".".to_string())
+        });
+        let repo = GitRepo::discover(&directory);
+        let worktree = repo
+            .as_ref()
+            .map(|r| r.worktree.clone())
+            .unwrap_or_else(|| directory.clone());
+        let models = message_models(&session.messages);
+        let session_model = models
+            .iter()
+            .rev()
+            .find_map(|m| m.clone())
+            .unwrap_or_else(placeholder_model);
         let now = chrono::Utc::now().timestamp_millis();
         // Identifiers must be TIME-SORTABLE, not random: opencode's run loop decides
         // whether a turn is finished with a raw lexicographic comparison of message
@@ -145,15 +156,6 @@ impl Format for Opencode {
 
         let mut out_messages = Vec::with_capacity(session.messages.len());
         let mut prev_id: Option<String> = None;
-        let cwd = session
-            .directory
-            .clone()
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|p| p.to_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| ".".to_string())
-            });
         // callID → (out_messages index, parts index) of the emitted "tool" part, so a
         // ToolResult arriving in a later message folds into that part's state.
         let mut tool_locs: std::collections::HashMap<String, (usize, usize)> =
@@ -163,9 +165,10 @@ impl Format for Opencode {
         // that never produced anything.
         let mut context_tokens: u64 = 0;
         let mut total_output: u64 = 0;
-        for msg in &session.messages {
+        for (msg, model) in session.messages.iter().zip(&models) {
             let msg_id = ids.next("msg", msg.time_created.max(0));
             let ts = msg.time_created;
+            let model = model.clone().unwrap_or_else(|| session_model.clone());
             let msg_info: serde_json::Value = match msg.role {
                 // opencode only accepts user/assistant; system messages are written as
                 // user with a "[system] " text prefix (recovered on read).
@@ -175,7 +178,7 @@ impl Format for Opencode {
                     "role": "user",
                     "time": { "created": ts },
                     "agent": "build",
-                    "model": { "providerID": "baton", "modelID": "imported" },
+                    "model": { "providerID": model.provider, "modelID": model.id },
                 }),
                 Role::Assistant => {
                     let pid = prev_id.clone().unwrap_or_else(|| msg_id.clone());
@@ -187,11 +190,11 @@ impl Format for Opencode {
                         "role": "assistant",
                         "time": { "created": ts, "completed": ts + 1 },
                         "parentID": pid,
-                        "modelID": "imported",
-                        "providerID": "baton",
+                        "modelID": model.id,
+                        "providerID": model.provider,
                         "mode": "build",
                         "agent": "build",
-                        "path": { "cwd": cwd, "root": cwd },
+                        "path": { "cwd": directory, "root": worktree },
                         "cost": 0,
                         "tokens": {
                             "input": context_tokens,
@@ -329,12 +332,12 @@ impl Format for Opencode {
             "info": {
                 "id": session_id,
                 "slug": slug,
-                "projectID": project_id,
-                "directory": session.directory.clone().unwrap_or_else(|| ".".to_string()),
-                "path": "",
+                "projectID": repo.as_ref().and_then(|r| r.root_commit.clone()).unwrap_or_else(|| "global".to_string()),
+                "directory": directory,
+                "path": repo.as_ref().map(|r| r.relative_path.clone()).unwrap_or_default(),
                 "title": format!("[{}] {}", session.origin, session.title),
                 "agent": "build",
-                "model": { "id": "imported", "providerID": "baton" },
+                "model": { "id": session_model.id, "providerID": session_model.provider },
                 "version": env!("CARGO_PKG_VERSION"),
                 "summary": { "additions": 0, "deletions": 0, "files": 0 },
                 "cost": 0,
@@ -390,106 +393,88 @@ fn slugify(s: &str) -> String {
     }
 }
 
-fn compute_project_id(dir: &str) -> String {
-    let abs = std::fs::canonicalize(dir)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| dir.to_string());
-    let mut hasher = Sha1::new();
-    hasher.update(abs.as_bytes());
-    hex_encode(&hasher.finalize())
-}
-
-// minimal sha1 (avoid pulling a crate for one hash)
-struct Sha1 {
-    state: [u32; 5],
-    len: u64,
-    buf: Vec<u8>,
-}
-
-impl Sha1 {
-    fn new() -> Self {
-        Self {
-            state: [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
-            len: 0,
-            buf: Vec::with_capacity(64),
-        }
-    }
-    fn update(&mut self, data: &[u8]) {
-        self.len += data.len() as u64;
-        self.buf.extend_from_slice(data);
-        while self.buf.len() >= 64 {
-            let block: [u8; 64] = self.buf[..64].try_into().unwrap();
-            self.process_block(&block);
-            self.buf.drain(..64);
-        }
-    }
-    fn finalize(mut self) -> [u8; 20] {
-        let bit_len = self.len * 8;
-        self.buf.push(0x80);
-        while self.buf.len() % 64 != 56 {
-            self.buf.push(0);
-        }
-        self.buf.extend_from_slice(&bit_len.to_be_bytes());
-        while self.buf.len() >= 64 {
-            let block: [u8; 64] = self.buf[..64].try_into().unwrap();
-            self.process_block(&block);
-            self.buf.drain(..64);
-        }
-        let mut out = [0u8; 20];
-        for (i, &s) in self.state.iter().enumerate() {
-            out[i * 4..i * 4 + 4].copy_from_slice(&s.to_be_bytes());
-        }
-        out
-    }
-    // index arithmetic mirrors the SHA-1 spec; iterator forms would obscure it
-    #[allow(clippy::needless_range_loop)]
-    fn process_block(&mut self, block: &[u8; 64]) {
-        let mut w = [0u32; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                block[i * 4],
-                block[i * 4 + 1],
-                block[i * 4 + 2],
-                block[i * 4 + 3],
-            ]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = self.state;
-        for i in 0..80 {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
-                _ => (b ^ c ^ d, 0xCA62C1D6),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(w[i]);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-        self.state[0] = self.state[0].wrapping_add(a);
-        self.state[1] = self.state[1].wrapping_add(b);
-        self.state[2] = self.state[2].wrapping_add(c);
-        self.state[3] = self.state[3].wrapping_add(d);
-        self.state[4] = self.state[4].wrapping_add(e);
+/// Placeholder for a session whose source recorded no model at all. opencode
+/// requires one on every message; resuming then prompts on the default model.
+fn placeholder_model() -> ModelRef {
+    ModelRef {
+        provider: "baton".to_string(),
+        id: "imported".to_string(),
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{:02x}", b));
+/// The model to record on each message. opencode stores a model on user messages
+/// too, and a resumed session continues on the model of its last user message
+/// (packages/tui/src/component/prompt/index.tsx), so a user message takes the
+/// model of the reply that answered it, or failing that the last one before it.
+fn message_models(messages: &[Message]) -> Vec<Option<ModelRef>> {
+    let mut models: Vec<Option<ModelRef>> = messages.iter().map(|m| m.model.clone()).collect();
+    let mut answered_by: Option<ModelRef> = None;
+    for (model, msg) in models.iter_mut().zip(messages).rev() {
+        if msg.role == Role::Assistant {
+            answered_by = model.clone().or(answered_by);
+        } else if model.is_none() {
+            model.clone_from(&answered_by);
+        }
     }
-    s
+    let mut last_seen: Option<ModelRef> = None;
+    for model in &mut models {
+        match model {
+            Some(m) => last_seen = Some(m.clone()),
+            None => model.clone_from(&last_seen),
+        }
+    }
+    models
+}
+
+/// The git repository containing a session's directory, when it exists on this
+/// machine.
+///
+/// opencode resolves the project itself on `opencode import`, binding the session
+/// to the project of the directory the import runs in, so the `projectID` written
+/// here only matters to opencode releases older than that. For those it is the
+/// repository's first root commit, the scheme they identify projects by, and
+/// "global" outside a repository.
+struct GitRepo {
+    worktree: String,
+    /// Session directory relative to `worktree`, as opencode's `info.path`.
+    relative_path: String,
+    root_commit: Option<String>,
+}
+
+impl GitRepo {
+    fn discover(directory: &str) -> Option<Self> {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(directory)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let worktree = git(&["rev-parse", "--show-toplevel"])?.trim().to_string();
+        let relative_path = std::fs::canonicalize(directory)
+            .ok()
+            .and_then(|dir| {
+                dir.strip_prefix(&worktree)
+                    .ok()
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+            })
+            .unwrap_or_default();
+        let mut roots: Vec<String> = git(&["rev-list", "--max-parents=0", "HEAD"])
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        roots.sort();
+        Some(Self {
+            worktree,
+            relative_path,
+            root_commit: roots.into_iter().next(),
+        })
+    }
 }
 
 // --- deserialization types for reading opencode exports ---
@@ -533,6 +518,33 @@ struct MessageInfo {
     role: String,
     #[serde(default)]
     time: TimeField,
+    /// Assistant messages carry the model flat...
+    #[serde(rename = "providerID", default)]
+    provider_id: Option<String>,
+    #[serde(rename = "modelID", default)]
+    model_id: Option<String>,
+    /// ...user messages nest it.
+    #[serde(default)]
+    model: Option<UserModel>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UserModel {
+    #[serde(rename = "providerID")]
+    provider_id: String,
+    #[serde(rename = "modelID")]
+    model_id: String,
+}
+
+impl MessageInfo {
+    fn model_ref(&self) -> Option<ModelRef> {
+        let (provider, id) = match (&self.provider_id, &self.model_id, &self.model) {
+            (Some(provider), Some(id), _) => (provider.clone(), id.clone()),
+            (_, _, Some(m)) => (m.provider_id.clone(), m.model_id.clone()),
+            _ => return None,
+        };
+        Some(ModelRef { provider, id }).filter(|m| *m != placeholder_model())
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -588,22 +600,6 @@ mod tests {
     use crate::canonical::{Format as _, Message, Role};
 
     #[test]
-    fn sha1_known_vectors() {
-        let mut h = Sha1::new();
-        h.update(b"abc");
-        assert_eq!(hex_encode(&h.finalize()), "a9993e364706816aba3e25717850c26c9cd0d89d");
-
-        let mut h = Sha1::new();
-        h.update(b"");
-        assert_eq!(hex_encode(&h.finalize()), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-
-        // >64 bytes to exercise multi-block path
-        let mut h = Sha1::new();
-        h.update("a".repeat(1000).as_bytes());
-        assert_eq!(hex_encode(&h.finalize()), "291e9a6c66994949b57ba5e650361e98fc36b1ba");
-    }
-
-    #[test]
     fn write_read_round_trip_preserves_tools_and_roles() {
         let session = Session {
             source_id: "orig".into(),
@@ -618,12 +614,14 @@ mod tests {
                     parts: vec![Part::text("be helpful")],
                     time_created: 1000,
                     origin: None,
+                    model: None,
                 },
                 Message {
                     role: Role::User,
                     parts: vec![Part::text("hi")],
                     time_created: 1001,
                     origin: None,
+                    model: None,
                 },
                 Message {
                     role: Role::Assistant,
@@ -637,6 +635,7 @@ mod tests {
                     ],
                     time_created: 1002,
                     origin: None,
+                    model: None,
                 },
                 Message {
                     // Claude-style: tool result arrives in a following user message
@@ -649,6 +648,7 @@ mod tests {
                     }],
                     time_created: 1003,
                     origin: None,
+                    model: None,
                 },
             ],
         };
@@ -679,6 +679,194 @@ mod tests {
             _ => None,
         });
         assert_eq!(result.expect("tool result folded into tool part"), Some("file.txt".into()));
+    }
+
+    fn opus() -> ModelRef {
+        ModelRef {
+            provider: "anthropic".into(),
+            id: "claude-opus-4-8".into(),
+        }
+    }
+
+    fn message(role: Role, text: &str, model: Option<ModelRef>) -> Message {
+        Message {
+            role,
+            parts: vec![Part::text(text)],
+            time_created: 1000,
+            origin: None,
+            model,
+        }
+    }
+
+    fn write_export(session: &Session, name: &str) -> serde_json::Value {
+        let dir = std::env::temp_dir().join(format!("baton-test-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("export.json");
+        Opencode::write(session, &path).unwrap();
+        let export = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        export
+    }
+
+    fn read_back(export: &serde_json::Value, name: &str) -> Session {
+        let dir =
+            std::env::temp_dir().join(format!("baton-test-back-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("export.json");
+        std::fs::write(&path, export.to_string()).unwrap();
+        let session = Opencode::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        session
+    }
+
+    fn session_in(directory: &str, messages: Vec<Message>) -> Session {
+        Session {
+            source_id: "orig".into(),
+            origin: Agent::ClaudeCode,
+            title: "Real title".into(),
+            time_created: 1000,
+            time_updated: 2000,
+            directory: Some(directory.into()),
+            messages,
+        }
+    }
+
+    #[test]
+    fn write_carries_the_source_model_onto_every_message() {
+        let sonnet = ModelRef {
+            provider: "anthropic".into(),
+            id: "claude-sonnet-5".into(),
+        };
+        let session = session_in(
+            "/nonexistent/baton-dir",
+            vec![
+                message(Role::User, "q1", None),
+                message(Role::Assistant, "a1", Some(opus())),
+                message(Role::User, "q2", None),
+                message(Role::Assistant, "a2", Some(sonnet.clone())),
+                message(Role::User, "q3, never answered", None),
+            ],
+        );
+        let export = write_export(&session, "models");
+        let msgs = export["messages"].as_array().unwrap();
+        let user_model = |i: usize| {
+            msgs[i]["info"]["model"]["modelID"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            user_model(0),
+            "claude-opus-4-8",
+            "a prompt takes the model that answered it"
+        );
+        assert_eq!(msgs[1]["info"]["providerID"], "anthropic");
+        assert_eq!(msgs[1]["info"]["modelID"], "claude-opus-4-8");
+        assert_eq!(user_model(2), "claude-sonnet-5");
+        assert_eq!(
+            user_model(4),
+            "claude-sonnet-5",
+            "an unanswered prompt keeps the last model"
+        );
+        assert_eq!(msgs[4]["info"]["model"]["providerID"], "anthropic");
+        assert_eq!(
+            export["info"]["model"],
+            serde_json::json!({ "id": "claude-sonnet-5", "providerID": "anthropic" })
+        );
+
+        let back = read_back(&export, "models");
+        assert_eq!(back.messages[1].model, Some(opus()));
+        assert_eq!(back.messages[3].model, Some(sonnet));
+    }
+
+    #[test]
+    fn write_without_any_model_keeps_the_placeholder() {
+        let export = write_export(
+            &session_in(
+                "/nonexistent/baton-dir",
+                vec![message(Role::User, "q", None)],
+            ),
+            "no-model",
+        );
+        assert_eq!(
+            export["messages"][0]["info"]["model"]["providerID"],
+            "baton"
+        );
+        let back = read_back(&export, "no-model");
+        assert_eq!(
+            back.messages[0].model, None,
+            "the placeholder is not read back as a model"
+        );
+    }
+
+    #[test]
+    fn write_binds_to_the_session_directory_outside_git() {
+        let session = session_in(
+            "/nonexistent/baton-dir",
+            vec![
+                message(Role::User, "q", None),
+                message(Role::Assistant, "a", Some(opus())),
+            ],
+        );
+        let export = write_export(&session, "nogit");
+        assert_eq!(export["info"]["directory"], "/nonexistent/baton-dir");
+        assert_eq!(export["info"]["projectID"], "global");
+        assert_eq!(export["info"]["title"], "[claude-code] Real title");
+        let path = &export["messages"][1]["info"]["path"];
+        assert_eq!(path["cwd"], "/nonexistent/baton-dir");
+        assert_eq!(path["root"], "/nonexistent/baton-dir");
+    }
+
+    #[test]
+    fn write_binds_to_the_git_repo_of_the_session_directory() {
+        let repo = std::env::temp_dir().join(format!("baton-test-repo-{}", std::process::id()));
+        let sub = repo.join("doc").join("ui");
+        std::fs::create_dir_all(&sub).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "root",
+        ]);
+        let root_commit = git(&["rev-parse", "HEAD"]);
+        let toplevel = git(&["rev-parse", "--show-toplevel"]);
+
+        let session = session_in(
+            sub.to_str().unwrap(),
+            vec![
+                message(Role::User, "q", None),
+                message(Role::Assistant, "a", Some(opus())),
+            ],
+        );
+        let export = write_export(&session, "git");
+        std::fs::remove_dir_all(&repo).ok();
+
+        assert_eq!(export["info"]["directory"], sub.to_str().unwrap());
+        assert_eq!(export["info"]["projectID"], root_commit.as_str());
+        assert_eq!(export["info"]["path"], "doc/ui");
+        let path = &export["messages"][1]["info"]["path"];
+        assert_eq!(path["cwd"], sub.to_str().unwrap());
+        assert_eq!(path["root"], toplevel.as_str());
     }
 
     #[test]

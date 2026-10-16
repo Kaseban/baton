@@ -61,6 +61,7 @@ impl Format for ContinueDev {
                 parts,
                 time_created: ts,
                 origin: Some(Agent::Continue),
+                model: None,
             });
             ts += 1;
         }

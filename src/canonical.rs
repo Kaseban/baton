@@ -139,6 +139,17 @@ pub struct Message {
     /// Origin agent that produced this message (useful when merging).
     #[serde(default)]
     pub origin: Option<Agent>,
+    /// Model that produced this message, when the source format records it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRef>,
+}
+
+/// A model as a provider id plus that provider's model id, e.g. `anthropic` +
+/// `claude-opus-4-8`, which is how opencode addresses models.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRef {
+    pub provider: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
