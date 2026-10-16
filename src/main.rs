@@ -6,6 +6,8 @@ mod canonical;
 mod config;
 mod convert;
 mod detect;
+#[cfg(target_os = "macos")]
+mod desktop;
 mod formats;
 mod pick;
 

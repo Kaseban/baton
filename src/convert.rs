@@ -163,6 +163,18 @@ fn import_claude(file: &Path) -> anyhow::Result<()> {
         "open it with: claude --resume {id}   (from {})",
         cwd.display()
     );
+    #[cfg(target_os = "macos")]
+    {
+        let root = dirs::home_dir().context("no home dir")?
+            .join("Library/Application Support/Claude/claude-code-sessions");
+        let scopes = crate::desktop::account_scopes(&root)?;
+        if !scopes.is_empty() {
+            let session = formats::read(Agent::ClaudeCode, file)?;
+            let entry = crate::desktop::Registration::new(&id, &cwd, &session)?;
+            let count = crate::desktop::register(&scopes, &entry)?;
+            eprintln!("registered in {count} Claude Desktop account/org directories; restart Claude Desktop to load the session in its Code tab");
+        }
+    }
     Ok(())
 }
 
