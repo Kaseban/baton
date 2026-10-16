@@ -128,6 +128,7 @@ impl Format for Zed {
                 parts,
                 time_created: ts,
                 origin: Some(Agent::Zed),
+                model: None,
             });
             ts += 1;
         }
@@ -324,6 +325,7 @@ mod tests {
                     parts: vec![Part::text("hello zed")],
                     time_created: 0,
                     origin: None,
+                    model: None,
                 },
                 Message {
                     role: Role::Assistant,
@@ -344,6 +346,7 @@ mod tests {
                     ],
                     time_created: 1,
                     origin: None,
+                    model: None,
                 },
             ],
         };

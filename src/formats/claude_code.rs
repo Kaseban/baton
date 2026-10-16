@@ -17,7 +17,7 @@ use anyhow::Context;
 use chrono::DateTime;
 use serde::Deserialize;
 
-use crate::canonical::{Agent, Format, Message, Part, Role, Session, SessionRef};
+use crate::canonical::{Agent, Format, Message, ModelRef, Part, Role, Session, SessionRef};
 
 pub struct ClaudeCode;
 
@@ -44,6 +44,9 @@ impl Format for ClaudeCode {
         let mut messages = Vec::new();
         let mut first_ts: Option<i64> = None;
         let mut last_ts: i64 = 0;
+        let mut directory: Option<String> = None;
+        let mut custom_title: Option<String> = None;
+        let mut ai_title: Option<String> = None;
 
         for line in raw.lines() {
             let line = line.trim();
@@ -54,7 +57,13 @@ impl Format for ClaudeCode {
                 Ok(e) => e,
                 Err(_) => continue,
             };
+            if directory.is_none() {
+                directory = entry.cwd.clone().filter(|c| !c.is_empty());
+            }
             match entry.entry_type.as_str() {
+                // Claude Code re-appends these whenever the title changes; the last one wins.
+                "custom-title" => custom_title = entry.custom_title.or(custom_title),
+                "ai-title" => ai_title = entry.ai_title.or(ai_title),
                 "user" | "assistant" => {
                     let Some(msg) = entry.message else { continue };
                     let role = match msg.role.as_str() {
@@ -82,6 +91,15 @@ impl Format for ClaudeCode {
                         parts,
                         time_created: ts,
                         origin: Some(Agent::ClaudeCode),
+                        // `<synthetic>` marks messages Claude Code made up itself (API
+                        // errors, interruptions); no model by that name exists.
+                        model: msg
+                            .model
+                            .filter(|m| !m.is_empty() && m != "<synthetic>")
+                            .map(|id| ModelRef {
+                                provider: "anthropic".to_string(),
+                                id,
+                            }),
                     });
                 }
                 _ => continue,
@@ -94,10 +112,13 @@ impl Format for ClaudeCode {
             title: String::new(),
             time_created: first_ts.unwrap_or(0),
             time_updated: last_ts,
-            directory: None,
+            directory,
             messages,
         };
-        session.title = truncate_title(session.first_user_text().unwrap_or(""));
+        session.title = match custom_title.or(ai_title) {
+            Some(title) => title,
+            None => truncate_title(session.first_user_text().unwrap_or("")),
+        };
         Ok(session)
     }
 
@@ -200,6 +221,12 @@ struct Entry {
     message: Option<ClaudeMessage>,
     #[serde(default)]
     timestamp: Option<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(rename = "customTitle", default)]
+    custom_title: Option<String>,
+    #[serde(rename = "aiTitle", default)]
+    ai_title: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,6 +237,8 @@ struct ClaudeMessage {
     content: serde_json::Value,
     #[serde(default)]
     timestamp: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 fn parse_content(content: &serde_json::Value) -> (Vec<Part>, bool) {
@@ -434,6 +463,62 @@ mod tests {
     }
 
     #[test]
+    fn read_keeps_directory_title_and_model() {
+        let dir = std::env::temp_dir().join(format!("baton-claude-meta-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("0b9c0000-0000-0000-0000-000000000000.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"ai-title","aiTitle":"Generated title","sessionId":"0b9c"}"#,
+            "\n",
+            r#"{"type":"user","cwd":"/work/repo/sub","message":{"role":"user","content":"a long first prompt"},"timestamp":"2024-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","cwd":"/work/repo/sub","message":{"role":"assistant","model":"claude-opus-4-8","content":[{"type":"text","text":"hi"}]},"timestamp":"2024-01-01T00:00:01Z"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"First name","sessionId":"0b9c"}"#,
+            "\n",
+            r#"{"type":"assistant","cwd":"/elsewhere","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"API Error"}]},"timestamp":"2024-01-01T00:00:02Z"}"#,
+            "\n",
+            r#"{"type":"custom-title","customTitle":"Renamed","sessionId":"0b9c"}"#,
+            "\n",
+        );
+        std::fs::write(&path, jsonl).unwrap();
+        let s = ClaudeCode::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(s.directory.as_deref(), Some("/work/repo/sub"));
+        assert_eq!(
+            s.title, "Renamed",
+            "the latest user-set title beats the generated one"
+        );
+        assert_eq!(s.messages[0].model, None);
+        assert_eq!(
+            s.messages[1].model,
+            Some(ModelRef {
+                provider: "anthropic".into(),
+                id: "claude-opus-4-8".into()
+            })
+        );
+        assert_eq!(s.messages[2].model, None, "<synthetic> is not a real model");
+    }
+
+    #[test]
+    fn read_falls_back_to_generated_then_prompt_title() {
+        let dir = std::env::temp_dir().join(format!("baton-claude-title-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prompt = r#"{"type":"user","message":{"role":"user","content":"first prompt"},"timestamp":"2024-01-01T00:00:00Z"}"#;
+
+        let path = dir.join("with-ai-title.jsonl");
+        let ai_title = r#"{"type":"ai-title","aiTitle":"Generated title"}"#;
+        std::fs::write(&path, format!("{prompt}\n{ai_title}\n")).unwrap();
+        assert_eq!(ClaudeCode::read(&path).unwrap().title, "Generated title");
+
+        let path = dir.join("untitled.jsonl");
+        std::fs::write(&path, format!("{prompt}\n")).unwrap();
+        assert_eq!(ClaudeCode::read(&path).unwrap().title, "first prompt");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn write_read_round_trip() {
         let dir = std::env::temp_dir().join(format!("baton-claude-rt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -452,6 +537,7 @@ mod tests {
                     parts: vec![Part::text("question")],
                     time_created: 1000,
                     origin: None,
+                    model: None,
                 },
                 Message {
                     role: Role::Assistant,
@@ -465,6 +551,7 @@ mod tests {
                     ],
                     time_created: 1001,
                     origin: None,
+                    model: None,
                 },
             ],
         };
