@@ -160,6 +160,7 @@ impl Format for Opencode {
         // ToolResult arriving in a later message folds into that part's state.
         let mut tool_locs: std::collections::HashMap<String, (usize, usize)> =
             std::collections::HashMap::new();
+        let mut attachment_count = 0;
         // Rough usage estimates (~4 chars/token): opencode's UI expects real
         // numbers here, and all-zero usage on every message reads as a session
         // that never produced anything.
@@ -209,8 +210,14 @@ impl Format for Opencode {
 
             let mut parts_json: Vec<serde_json::Value> = Vec::new();
             let mut first_text = true;
+            // The tool part a ToolResult just folded into: attachments right after the
+            // result are that tool's output (a screenshot it took, an image it read).
+            let mut result_tool: Option<(usize, usize)> = None;
             for p in &msg.parts {
                 let part_id = ids.next("prt", msg.time_created.max(0));
+                if !matches!(p, Part::Attachment { .. }) {
+                    result_tool = None;
+                }
                 match p {
                     Part::Text { text } => {
                         let text = if msg.role == Role::System && first_text {
@@ -290,6 +297,8 @@ impl Format for Opencode {
                         let folded = id.as_ref().and_then(|cid| tool_locs.get(cid).copied());
                         let out_text = output.clone().unwrap_or_default();
                         let errored = is_error.unwrap_or(false);
+                        // opencode only keeps attachments on completed tool states.
+                        result_tool = folded.filter(|_| !errored);
                         match folded {
                             Some((mi, pi)) => {
                                 let target = if mi == out_messages.len() {
@@ -324,13 +333,65 @@ impl Format for Opencode {
                             })),
                         }
                     }
-                    Part::Attachment { .. } => parts_json.push(serde_json::json!({
-                        "type": "text",
-                        "text": "[attachment]",
-                        "id": part_id,
-                        "sessionID": session_id,
-                        "messageID": msg_id,
-                    })),
+                    Part::Attachment { mime, path, data } => {
+                        let url = match (data, path) {
+                            (Some(data), _) => format!("data:{mime};base64,{data}"),
+                            (None, Some(path)) => format!("file://{path}"),
+                            (None, None) => {
+                                parts_json.push(serde_json::json!({
+                                    "type": "text",
+                                    "text": "[attachment]",
+                                    "id": part_id,
+                                    "sessionID": session_id,
+                                    "messageID": msg_id,
+                                }));
+                                continue;
+                            }
+                        };
+                        attachment_count += 1;
+                        let filename = path
+                            .as_deref()
+                            .and_then(|p| Path::new(p).file_name())
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| {
+                                let (kind, ext) = mime.split_once('/').unwrap_or(("file", "bin"));
+                                format!("{kind}-{attachment_count:03}.{ext}")
+                            });
+                        let file_part = |message_id: &serde_json::Value| {
+                            serde_json::json!({
+                                "type": "file",
+                                "mime": mime,
+                                "filename": filename,
+                                "url": url,
+                                "id": part_id,
+                                "sessionID": session_id,
+                                "messageID": message_id,
+                            })
+                        };
+                        let tool_part = result_tool.and_then(|(mi, pi)| {
+                            if mi == out_messages.len() {
+                                parts_json.get_mut(pi)
+                            } else {
+                                out_messages
+                                    .get_mut(mi)
+                                    .and_then(|m: &mut serde_json::Value| m.get_mut("parts"))
+                                    .and_then(|ps| ps.get_mut(pi))
+                            }
+                        });
+                        match tool_part {
+                            Some(tool) => {
+                                let file = file_part(&tool["messageID"]);
+                                let state = &mut tool["state"];
+                                if !state["attachments"].is_array() {
+                                    state["attachments"] = serde_json::json!([]);
+                                }
+                                if let Some(list) = state["attachments"].as_array_mut() {
+                                    list.push(file);
+                                }
+                            }
+                            None => parts_json.push(file_part(&serde_json::json!(msg_id))),
+                        }
+                    }
                 }
             }
 
@@ -983,6 +1044,102 @@ mod tests {
         let path = &export["messages"][1]["info"]["path"];
         assert_eq!(path["cwd"], sub.to_str().unwrap());
         assert_eq!(path["root"], toplevel.as_str());
+    }
+
+    #[test]
+    fn write_turns_images_into_file_parts() {
+        let png = Part::Attachment {
+            mime: "image/png".into(),
+            path: None,
+            data: Some("UE5H".into()),
+        };
+        let jpeg = Part::Attachment {
+            mime: "image/jpeg".into(),
+            path: None,
+            data: Some("SlBH".into()),
+        };
+        let message = |role, parts, time_created| Message {
+            role,
+            parts,
+            time_created,
+            origin: None,
+            model: None,
+        };
+        let call = |id: &str| Part::ToolCall {
+            name: "Read".into(),
+            id: Some(id.into()),
+            input: None,
+        };
+        let result = |id: &str, is_error| Part::ToolResult {
+            name: "tool".into(),
+            id: Some(id.into()),
+            output: Some("out".into()),
+            is_error: Some(is_error),
+        };
+        let session = Session {
+            source_id: "orig".into(),
+            origin: Agent::ClaudeCode,
+            title: "images".into(),
+            time_created: 1000,
+            time_updated: 1004,
+            directory: Some("/tmp".into()),
+            messages: vec![
+                message(
+                    Role::User,
+                    vec![png.clone(), Part::text("what is this?")],
+                    1000,
+                ),
+                message(
+                    Role::Assistant,
+                    vec![call("call_ok"), call("call_err")],
+                    1001,
+                ),
+                message(
+                    Role::User,
+                    vec![result("call_ok", false), jpeg.clone()],
+                    1002,
+                ),
+                message(Role::User, vec![result("call_err", true), jpeg], 1003),
+            ],
+        };
+
+        let dir = std::env::temp_dir().join(format!("baton-test-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("images.json");
+        Opencode::write(&session, &path).unwrap();
+        let export: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let msgs = export["messages"].as_array().unwrap();
+        let pasted = &msgs[0]["parts"][0];
+        assert_eq!(pasted["type"], "file");
+        assert_eq!(pasted["mime"], "image/png");
+        assert_eq!(pasted["url"], "data:image/png;base64,UE5H");
+        assert_eq!(pasted["filename"], "image-001.png");
+        assert_eq!(pasted["messageID"], msgs[0]["info"]["id"]);
+
+        let assistant = &msgs[1];
+        let attachments = assistant["parts"][0]["state"]["attachments"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            attachments.len(),
+            1,
+            "a tool result's image stays with that tool"
+        );
+        assert_eq!(attachments[0]["url"], "data:image/jpeg;base64,SlBH");
+        assert_eq!(attachments[0]["messageID"], assistant["info"]["id"]);
+
+        assert_eq!(assistant["parts"][1]["state"]["status"], "error");
+        assert!(assistant["parts"][1]["state"].get("attachments").is_none());
+        assert_eq!(msgs.len(), 3, "the successful result folded away entirely");
+        let kept = &msgs[2]["parts"][0];
+        assert_eq!(
+            kept["type"], "file",
+            "an errored tool cannot hold it, so the image stays in its message"
+        );
+        assert_eq!(kept["url"], "data:image/jpeg;base64,SlBH");
     }
 
     #[test]

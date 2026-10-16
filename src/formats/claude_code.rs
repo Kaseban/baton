@@ -312,7 +312,18 @@ fn parse_content(content: &serde_json::Value) -> (Vec<Part>, bool) {
                                 output,
                                 is_error,
                             });
+                            // The result's images follow it as attachments; writers that
+                            // can attach files to a tool result pick them up from there.
+                            if let Some(serde_json::Value::Array(blocks)) = block.get("content") {
+                                parts.extend(blocks.iter().filter_map(image_attachment));
+                            }
                             has_content = true;
+                        }
+                        "image" => {
+                            if let Some(image) = image_attachment(block) {
+                                parts.push(image);
+                                has_content = true;
+                            }
                         }
                         _ => {}
                     }
@@ -353,6 +364,26 @@ fn flatten_tool_result_content(blocks: &[serde_json::Value]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// An Anthropic `{"type":"image","source":{"type":"base64",...}}` block as an attachment.
+fn image_attachment(block: &serde_json::Value) -> Option<Part> {
+    if block.get("type").and_then(|v| v.as_str()) != Some("image") {
+        return None;
+    }
+    let source = block.get("source")?;
+    if source.get("type").and_then(|v| v.as_str()) != Some("base64") {
+        return None;
+    }
+    Some(Part::Attachment {
+        mime: source
+            .get("media_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("image/png")
+            .to_string(),
+        path: None,
+        data: Some(source.get("data")?.as_str()?.to_string()),
+    })
 }
 
 fn is_meta_user(text: &str) -> bool {
@@ -416,6 +447,14 @@ fn parts_to_claude_content(parts: &[Part]) -> serde_json::Value {
                 "tool_use_id": id.clone().unwrap_or_default(),
                 "content": output.clone().unwrap_or_default(),
                 "is_error": is_error.unwrap_or(false),
+            }),
+            Part::Attachment {
+                mime,
+                path: _,
+                data: Some(data),
+            } if mime.starts_with("image/") => serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": mime, "data": data },
             }),
             Part::Attachment { mime, path, data } => {
                 let mut o = serde_json::json!({"type":"attachment","mime": mime});
@@ -516,6 +555,84 @@ mod tests {
         std::fs::write(&path, format!("{prompt}\n")).unwrap();
         assert_eq!(ClaudeCode::read(&path).unwrap().title, "first prompt");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_keeps_pasted_and_tool_result_images() {
+        let dir = std::env::temp_dir().join(format!("baton-claude-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("1a2b0000-0000-0000-0000-000000000000.jsonl");
+        let jsonl = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"UE5H"}},{"type":"text","text":"what is this?"}]},"timestamp":"2024-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/x.jpg"}}]},"timestamp":"2024-01-01T00:00:01Z"}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"read it"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"SlBH"}}]}]},"timestamp":"2024-01-01T00:00:02Z"}"#,
+            "\n",
+        );
+        std::fs::write(&path, jsonl).unwrap();
+        let s = ClaudeCode::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(s.title, "what is this?");
+        assert!(
+            matches!(&s.messages[0].parts[0], Part::Attachment { mime, data, .. } if mime == "image/png" && data.as_deref() == Some("UE5H"))
+        );
+        let result = &s.messages[2].parts;
+        assert!(
+            matches!(&result[0], Part::ToolResult { output, .. } if output.as_deref().unwrap().starts_with("read it\n[image omitted: image/jpeg"))
+        );
+        assert!(
+            matches!(&result[1], Part::Attachment { mime, data, .. } if mime == "image/jpeg" && data.as_deref() == Some("SlBH"))
+        );
+    }
+
+    #[test]
+    fn write_emits_images_as_image_blocks() {
+        let dir = std::env::temp_dir().join(format!("baton-claude-img-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("22222222-2222-3333-4444-555555555555.jsonl");
+        let session = Session {
+            source_id: "22222222-2222-3333-4444-555555555555".into(),
+            origin: Agent::Opencode,
+            title: "t".into(),
+            time_created: 1000,
+            time_updated: 1000,
+            directory: None,
+            messages: vec![Message {
+                role: Role::User,
+                parts: vec![
+                    Part::text("look"),
+                    Part::Attachment {
+                        mime: "image/png".into(),
+                        path: None,
+                        data: Some("UE5H".into()),
+                    },
+                ],
+                time_created: 1000,
+                origin: None,
+                model: None,
+            }],
+        };
+        ClaudeCode::write(&session, &path).unwrap();
+        let line: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        let back = ClaudeCode::read(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            line["message"]["content"][1],
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":"UE5H"}})
+        );
+        assert!(
+            matches!(&back.messages[0].parts[1], Part::Attachment { data, .. } if data.as_deref() == Some("UE5H"))
+        );
     }
 
     #[test]
