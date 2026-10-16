@@ -631,7 +631,11 @@ impl GitRepo {
         let relative_path = std::fs::canonicalize(directory)
             .ok()
             .and_then(|dir| {
-                dir.strip_prefix(&worktree)
+                // Windows canonical paths use a verbatim prefix, while git's
+                // toplevel uses a regular path. Compare canonical forms on
+                // both sides so a repository subdirectory keeps its path.
+                let root = std::fs::canonicalize(&worktree).ok()?;
+                dir.strip_prefix(root)
                     .ok()
                     .map(|p| p.to_string_lossy().replace('\\', "/"))
             })
